@@ -20,7 +20,6 @@ import static java.util.Objects.requireNonNull;
 
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 
 import com.linecorp.centraldogma.common.Author;
@@ -31,6 +30,7 @@ import com.linecorp.centraldogma.common.Markup;
 import com.linecorp.centraldogma.common.Query;
 import com.linecorp.centraldogma.common.QueryResult;
 import com.linecorp.centraldogma.common.Revision;
+import com.linecorp.centraldogma.common.RevisionRange;
 import com.linecorp.centraldogma.internal.Util;
 import com.linecorp.centraldogma.server.internal.storage.project.Project;
 
@@ -58,8 +58,23 @@ public class RepositoryWrapper implements Repository {
     }
 
     @Override
-    public CompletableFuture<Revision> normalize(Revision revision) {
-        return unwrap().normalize(revision);
+    public long creationTimeMillis() {
+        return unwrap().creationTimeMillis();
+    }
+
+    @Override
+    public Author author() {
+        return unwrap().author();
+    }
+
+    @Override
+    public Revision normalizeNow(Revision revision) {
+        return unwrap().normalizeNow(revision);
+    }
+
+    @Override
+    public RevisionRange normalizeNow(Revision from, Revision to) {
+        return unwrap().normalizeNow(from, to);
     }
 
     @Override
@@ -132,54 +147,39 @@ public class RepositoryWrapper implements Repository {
     }
 
     @Override
-    public CompletableFuture<Revision> commit(Revision baseRevision, Author author,
-                                              String summary, Iterable<Change<?>> changes) {
-        return unwrap().commit(baseRevision, author, summary, changes);
+    public CompletableFuture<Revision> commit(Revision baseRevision, long commitTimeMillis,
+                                              Author author, String summary, Iterable<Change<?>> changes) {
+        return unwrap().commit(baseRevision, commitTimeMillis, author, summary, changes);
     }
 
     @Override
-    public CompletableFuture<Revision> commit(Revision baseRevision, Author author,
-                                              String summary, Change<?>... changes) {
-        return unwrap().commit(baseRevision, author, summary, changes);
+    public CompletableFuture<Revision> commit(Revision baseRevision, long commitTimeMillis,
+                                              Author author, String summary, Change<?>... changes) {
+        return unwrap().commit(baseRevision, commitTimeMillis, author, summary, changes);
     }
 
     @Override
-    public CompletableFuture<Revision> commit(Revision baseRevision, Author author,
-                                              String summary, String detail, Markup markup,
+    public CompletableFuture<Revision> commit(Revision baseRevision, long commitTimeMillis,
+                                              Author author, String summary, String detail, Markup markup,
                                               Iterable<Change<?>> changes) {
-        return unwrap().commit(baseRevision, author, summary, detail, markup, changes);
+        return unwrap().commit(baseRevision, commitTimeMillis, author, summary, detail, markup, changes);
     }
 
     @Override
-    public CompletableFuture<Revision> commit(Revision baseRevision, Author author,
-                                              String summary, String detail, Markup markup,
+    public CompletableFuture<Revision> commit(Revision baseRevision, long commitTimeMillis,
+                                              Author author, String summary, String detail, Markup markup,
                                               Change<?>... changes) {
-        return unwrap().commit(baseRevision, author, summary, detail, markup, changes);
+        return unwrap().commit(baseRevision, commitTimeMillis, author, summary, detail, markup, changes);
     }
 
     @Override
-    public CompletableFuture<Revision> watch(Revision lastKnownRev, String pathPattern) {
-        return unwrap().watch(lastKnownRev, pathPattern);
+    public CompletableFuture<Revision> watch(Revision lastKnownRevision, String pathPattern) {
+        return unwrap().watch(lastKnownRevision, pathPattern);
     }
 
     @Override
-    public <T> CompletableFuture<QueryResult<T>> watch(Revision lastKnownRev, Query<T> query) {
-        return unwrap().watch(lastKnownRev, query);
-    }
-
-    @Override
-    public CompletableFuture<Revision> createRunspace(Author author, int majorRevision) {
-        return unwrap().createRunspace(author, majorRevision);
-    }
-
-    @Override
-    public CompletableFuture<Void> removeRunspace(int majorRevision) {
-        return unwrap().removeRunspace(majorRevision);
-    }
-
-    @Override
-    public CompletableFuture<Set<Revision>> listRunspaces() {
-        return unwrap().listRunspaces();
+    public <T> CompletableFuture<QueryResult<T>> watch(Revision lastKnownRevision, Query<T> query) {
+        return unwrap().watch(lastKnownRevision, query);
     }
 
     @Override

@@ -39,8 +39,8 @@ import com.fasterxml.jackson.databind.annotation.JsonDeserialize;
 
 import com.linecorp.centraldogma.internal.Jackson;
 import com.linecorp.centraldogma.internal.Util;
+import com.linecorp.centraldogma.internal.jsonpatch.JsonPatch;
 import com.linecorp.centraldogma.internal.jsonpatch.ReplaceMode;
-import com.linecorp.centraldogma.internal.jsonpatch.diff.JsonDiff;
 
 import difflib.DiffUtils;
 import difflib.Patch;
@@ -144,7 +144,6 @@ public interface Change<T> {
      *                  <a href="https://en.wikipedia.org/wiki/Diff_utility#Unified_format">unified format</a>
      */
     static Change<String> ofTextPatch(String path, String textPatch) {
-        validateFilePath(path, "path");
         requireNonNull(textPatch, "textPatch");
 
         return new DefaultChange<>(path, ChangeType.APPLY_TEXT_PATCH, textPatch);
@@ -161,8 +160,6 @@ public interface Change<T> {
      *                               not a valid JSON
      */
     static Change<JsonNode> ofJsonPatch(String path, String oldJsonText, String newJsonText) {
-
-        validateFilePath(path, "path");
         requireNonNull(newJsonText, "newJsonText");
 
         JsonNode oldJsonNode;
@@ -175,8 +172,8 @@ public interface Change<T> {
             throw new ChangeFormatException("failed to read a value as a JSON tree", e);
         }
 
-        return new DefaultChange<>(path, ChangeType.APPLY_JSON_PATCH, JsonDiff.asJson(oldJsonNode, newJsonNode,
-                                                                                      ReplaceMode.SAFE));
+        return new DefaultChange<>(path, ChangeType.APPLY_JSON_PATCH,
+                                   JsonPatch.generate(oldJsonNode, newJsonNode, ReplaceMode.SAFE).toJson());
     }
 
     /**
@@ -187,15 +184,14 @@ public interface Change<T> {
      * @param newJsonNode the new content of the file
      */
     static Change<JsonNode> ofJsonPatch(String path, JsonNode oldJsonNode, JsonNode newJsonNode) {
-        validateFilePath(path, "path");
         requireNonNull(newJsonNode, "newJsonNode");
 
         if (oldJsonNode == null) {
             oldJsonNode = Jackson.nullNode;
         }
 
-        return new DefaultChange<>(path, ChangeType.APPLY_JSON_PATCH, JsonDiff.asJson(oldJsonNode, newJsonNode,
-                                                                                      ReplaceMode.SAFE));
+        return new DefaultChange<>(path, ChangeType.APPLY_JSON_PATCH,
+                                   JsonPatch.generate(oldJsonNode, newJsonNode, ReplaceMode.SAFE).toJson());
     }
 
     /**
@@ -226,7 +222,6 @@ public interface Change<T> {
      * @param jsonPatchNode the patch in <a href="https://tools.ietf.org/html/rfc6902">JSON patch format</a>
      */
     static Change<JsonNode> ofJsonPatch(String path, JsonNode jsonPatchNode) {
-        validateFilePath(path, "path");
         requireNonNull(jsonPatchNode, "jsonPatchNode");
 
         return new DefaultChange<>(path, ChangeType.APPLY_JSON_PATCH, jsonPatchNode);
@@ -297,12 +292,12 @@ public interface Change<T> {
         }
 
         switch (entryType) {
-        case JSON:
-            return ofJsonUpsert(targetPath, content);
-        case TEXT:
-            return ofTextUpsert(targetPath, content);
-        default:
-            throw new Error("unexpected entry type: " + entryType);
+            case JSON:
+                return ofJsonUpsert(targetPath, content);
+            case TEXT:
+                return ofTextUpsert(targetPath, content);
+            default:
+                throw new Error("unexpected entry type: " + entryType);
         }
     }
 

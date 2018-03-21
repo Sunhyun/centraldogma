@@ -20,6 +20,11 @@ import static java.util.Objects.requireNonNull;
 
 import java.util.Arrays;
 
+import javax.annotation.Nullable;
+
+import org.apache.shiro.session.mgt.SimpleSession;
+
+import com.fasterxml.jackson.annotation.JsonProperty;
 import com.fasterxml.jackson.annotation.JsonSubTypes;
 import com.fasterxml.jackson.annotation.JsonSubTypes.Type;
 import com.fasterxml.jackson.annotation.JsonTypeInfo;
@@ -39,86 +44,171 @@ import com.linecorp.centraldogma.common.Revision;
         @Type(value = RemoveRepositoryCommand.class, name = "REMOVE_REPOSITORY"),
         @Type(value = UnremoveRepositoryCommand.class, name = "UNREMOVE_REPOSITORY"),
         @Type(value = PushCommand.class, name = "PUSH"),
-        @Type(value = CreateRunspaceCommand.class, name = "CREATE_RUNSPACE"),
-        @Type(value = RemoveRunspaceCommand.class, name = "REMOVE_RUNSPACE"),
         @Type(value = SaveNamedQueryCommand.class, name = "SAVE_NAMED_QUERY"),
         @Type(value = RemoveNamedQueryCommand.class, name = "REMOVE_NAMED_QUERY"),
         @Type(value = SavePluginCommand.class, name = "SAVE_PLUGIN"),
         @Type(value = RemovePluginCommand.class, name = "REMOVE_PLUGIN"),
+        @Type(value = CreateSessionCommand.class, name = "CREATE_SESSIONS"),
+        @Type(value = RemoveSessionCommand.class, name = "REMOVE_SESSIONS"),
 })
 public interface Command<T> {
 
-    static Command<Void> createProject(String name) {
-        return new CreateProjectCommand(name);
+    static Command<Void> createProject(Author author, String name) {
+        return createProject(null, author, name);
     }
 
-    static Command<Void> removeProject(String name) {
-        return new RemoveProjectCommand(name);
+    static Command<Void> createProject(@Nullable Long timestamp, Author author, String name) {
+        requireNonNull(author, "author");
+        return new CreateProjectCommand(timestamp, author, name);
     }
 
-    static Command<Void> unremoveProject(String name) {
-        return new UnremoveProjectCommand(name);
+    static Command<Void> removeProject(Author author, String name) {
+        return removeProject(null, author, name);
     }
 
-    static Command<Void> createRepository(String projectName, String repositoryName) {
-        return new CreateRepositoryCommand(projectName, repositoryName);
+    static Command<Void> removeProject(@Nullable Long timestamp, Author author, String name) {
+        requireNonNull(author, "author");
+        return new RemoveProjectCommand(timestamp, author, name);
     }
 
-    static Command<Void> removeRepository(String projectName, String repositoryName) {
-        return new RemoveRepositoryCommand(projectName, repositoryName);
+    static Command<Void> unremoveProject(Author author, String name) {
+        return unremoveProject(null, author, name);
     }
 
-    static Command<Void> unremoveRepository(String projectName, String repositoryName) {
-        return new UnremoveRepositoryCommand(projectName, repositoryName);
+    static Command<Void> unremoveProject(@Nullable Long timestamp, Author author, String name) {
+        requireNonNull(author, "author");
+        return new UnremoveProjectCommand(timestamp, author, name);
     }
 
-    static Command<Revision> push(String projectName, String repositoryName,
-                                  Revision baseRevision, Author author, String summary, String detail,
+    static Command<Void> createRepository(Author author, String projectName, String repositoryName) {
+        return createRepository(null, author, projectName, repositoryName);
+    }
+
+    static Command<Void> createRepository(@Nullable Long timestamp, Author author,
+                                          String projectName, String repositoryName) {
+        requireNonNull(author, "author");
+        return new CreateRepositoryCommand(timestamp, author, projectName, repositoryName);
+    }
+
+    static Command<Void> removeRepository(Author author, String projectName, String repositoryName) {
+        return removeRepository(null, author, projectName, repositoryName);
+    }
+
+    static Command<Void> removeRepository(@Nullable Long timestamp, Author author,
+                                          String projectName, String repositoryName) {
+        requireNonNull(author, "author");
+        return new RemoveRepositoryCommand(timestamp, author, projectName, repositoryName);
+    }
+
+    static Command<Void> unremoveRepository(Author author, String projectName, String repositoryName) {
+        return unremoveRepository(null, author, projectName, repositoryName);
+    }
+
+    static Command<Void> unremoveRepository(@Nullable Long timestamp, Author author,
+                                            String projectName, String repositoryName) {
+        requireNonNull(author, "author");
+        return new UnremoveRepositoryCommand(timestamp, author, projectName, repositoryName);
+    }
+
+    static Command<Revision> push(Author author, String projectName, String repositoryName,
+                                  Revision baseRevision, String summary, String detail,
                                   Markup markup, Change<?>... changes) {
 
+        return push(null, author, projectName, repositoryName, baseRevision, summary, detail, markup, changes);
+    }
+
+    static Command<Revision> push(@Nullable Long timestamp, Author author,
+                                  String projectName, String repositoryName,
+                                  Revision baseRevision, String summary, String detail,
+                                  Markup markup, Change<?>... changes) {
+
+        requireNonNull(author, "author");
         requireNonNull(changes, "changes");
-        return new PushCommand(projectName, repositoryName,
-                               baseRevision, author, summary, detail, markup, Arrays.asList(changes));
+        return new PushCommand(timestamp, author, projectName, repositoryName, baseRevision,
+                               summary, detail, markup, Arrays.asList(changes));
     }
 
-    static Command<Revision> push(String projectName, String repositoryName,
-                                Revision baseRevision, Author author, String summary, String detail,
-                                Markup markup, Iterable<Change<?>> changes) {
+    static Command<Revision> push(Author author, String projectName, String repositoryName,
+                                  Revision baseRevision, String summary, String detail,
+                                  Markup markup, Iterable<Change<?>> changes) {
 
-        return new PushCommand(projectName, repositoryName,
-                               baseRevision, author, summary, detail, markup, changes);
+        return push(null, author, projectName, repositoryName, baseRevision, summary, detail, markup, changes);
     }
 
-    static Command<Void> createRunspace(String projectName, String repositoryName,
-                                        Author author, int baseRevision) {
+    static Command<Revision> push(@Nullable Long timestamp, Author author,
+                                  String projectName, String repositoryName,
+                                  Revision baseRevision, String summary, String detail,
+                                  Markup markup, Iterable<Change<?>> changes) {
 
-        return new CreateRunspaceCommand(projectName, repositoryName, author, baseRevision);
+        requireNonNull(author, "author");
+        return new PushCommand(timestamp, author, projectName, repositoryName, baseRevision,
+                               summary, detail, markup, changes);
     }
 
-    static Command<Void> removeRunspace(String projectName, String repositoryName, int baseRevision) {
-        return new RemoveRunspaceCommand(projectName, repositoryName, baseRevision);
+    static Command<Void> saveNamedQuery(Author author, String projectName,
+                                        String queryName, boolean enabled, String repositoryName,
+                                        Query<?> query, String comment, Markup markup) {
+
+        return saveNamedQuery(null, author, projectName,
+                              queryName, enabled, repositoryName,
+                              query, comment, markup);
     }
 
-    static Command<Void> saveNamedQuery(String projectName, String queryName, boolean enabled,
-                                        String repositoryName, Query<?> query, String comment, Markup markup) {
+    static Command<Void> saveNamedQuery(@Nullable Long timestamp, Author author, String projectName,
+                                        String queryName, boolean enabled, String repositoryName,
+                                        Query<?> query, String comment, Markup markup) {
 
-        return new SaveNamedQueryCommand(projectName, queryName, enabled,
-                                         repositoryName, query, comment, markup);
+        requireNonNull(author, "author");
+        return new SaveNamedQueryCommand(timestamp, author, projectName,
+                                         queryName, enabled, repositoryName,
+                                         query, comment, markup);
     }
 
-    static Command<Void> removeNamedQuery(String projectName, String name) {
-        return new RemoveNamedQueryCommand(projectName, name);
+    static Command<Void> removeNamedQuery(Author author, String projectName, String name) {
+        return removeNamedQuery(null, author, projectName, name);
     }
 
-    static Command<Void> savePlugin(String projectName, String pluginName, String path) {
-        return new SavePluginCommand(projectName, pluginName, path);
+    static Command<Void> removeNamedQuery(@Nullable Long timestamp, Author author,
+                                          String projectName, String name) {
+        requireNonNull(author, "author");
+        return new RemoveNamedQueryCommand(timestamp, author, projectName, name);
     }
 
-    static Command<Void> removePlugin(String projectName, String pluginName) {
-        return new RemovePluginCommand(projectName, pluginName);
+    static Command<Void> savePlugin(Author author, String projectName, String pluginName, String path) {
+        return savePlugin(null, author, projectName, pluginName, path);
+    }
+
+    static Command<Void> savePlugin(@Nullable Long timestamp, Author author,
+                                    String projectName, String pluginName, String path) {
+        requireNonNull(author, "author");
+        return new SavePluginCommand(timestamp, author, projectName, pluginName, path);
+    }
+
+    static Command<Void> removePlugin(Author author, String projectName, String pluginName) {
+        return removePlugin(null, author, projectName, pluginName);
+    }
+
+    static Command<Void> removePlugin(@Nullable Long timestamp, Author author,
+                                      String projectName, String pluginName) {
+        requireNonNull(author, "author");
+        return new RemovePluginCommand(timestamp, author, projectName, pluginName);
+    }
+
+    static Command<Void> createSession(SimpleSession session) {
+        return new CreateSessionCommand(null, null, session);
+    }
+
+    static Command<Void> removeSession(String sessionId) {
+        return new RemoveSessionCommand(null, null, sessionId);
     }
 
     CommandType type();
+
+    @JsonProperty
+    long timestamp();
+
+    @JsonProperty
+    Author author();
 
     String executionPath();
 }

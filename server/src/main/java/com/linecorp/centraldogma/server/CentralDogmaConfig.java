@@ -23,6 +23,7 @@ import static com.linecorp.centraldogma.server.CentralDogmaBuilder.DEFAULT_MAX_N
 import static com.linecorp.centraldogma.server.CentralDogmaBuilder.DEFAULT_MAX_NUM_FILES_PER_MIRROR;
 import static com.linecorp.centraldogma.server.CentralDogmaBuilder.DEFAULT_NUM_MIRRORING_THREADS;
 import static com.linecorp.centraldogma.server.CentralDogmaBuilder.DEFAULT_NUM_REPOSITORY_WORKERS;
+import static com.linecorp.centraldogma.server.CentralDogmaBuilder.DEFAULT_WEB_APP_SESSION_TIMEOUT_MILLIS;
 import static java.util.Objects.requireNonNull;
 
 import java.io.File;
@@ -30,6 +31,9 @@ import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.util.List;
 import java.util.Optional;
+import java.util.Set;
+
+import javax.annotation.Nullable;
 
 import com.fasterxml.jackson.annotation.JsonProperty;
 import com.fasterxml.jackson.core.JsonGenerator;
@@ -47,6 +51,7 @@ import com.fasterxml.jackson.databind.node.JsonNodeType;
 import com.fasterxml.jackson.databind.util.StdConverter;
 import com.google.common.base.Ascii;
 import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableSet;
 
 import com.linecorp.armeria.common.SessionProtocol;
 import com.linecorp.armeria.server.ServerPort;
@@ -55,7 +60,6 @@ import com.linecorp.centraldogma.server.internal.storage.repository.cache.Reposi
 
 import io.netty.util.NetUtil;
 
-// TODO(trustin): Expose SSL configuration properties.
 final class CentralDogmaConfig {
 
     private final File dataDir;
@@ -67,6 +71,7 @@ final class CentralDogmaConfig {
     private final Long requestTimeoutMillis;
     private final Long idleTimeoutMillis;
     private final Integer maxFrameLength;
+    private final TlsConfig tls;
 
     // Repository
     private final Integer numRepositoryWorkers;
@@ -76,6 +81,7 @@ final class CentralDogmaConfig {
 
     // Web dashboard
     private final boolean webAppEnabled;
+    private final long webAppSessionTimeoutMillis;
 
     // Mirroring
     private final boolean mirroringEnabled;
@@ -91,11 +97,19 @@ final class CentralDogmaConfig {
 
     // Security
     private final boolean securityEnabled;
+    private final boolean csrfTokenRequiredForThrift;
+
+    // Access log
+    private final String accessLogFormat;
+
+    // Administrator
+    private final Set<String> administrators;
 
     CentralDogmaConfig(@JsonProperty(value = "dataDir", required = true) File dataDir,
                        @JsonProperty(value = "ports", required = true)
                        @JsonDeserialize(contentUsing = ServerPortDeserializer.class)
-                       List<ServerPort> ports,
+                               List<ServerPort> ports,
+                       @JsonProperty("tls") TlsConfig tls,
                        @JsonProperty("numWorkers") Integer numWorkers,
                        @JsonProperty("maxNumConnections") Integer maxNumConnections,
                        @JsonProperty("requestTimeoutMillis") Long requestTimeoutMillis,
@@ -104,18 +118,23 @@ final class CentralDogmaConfig {
                        @JsonProperty("numRepositoryWorkers") Integer numRepositoryWorkers,
                        @JsonProperty("cacheSpec") String cacheSpec,
                        @JsonProperty("gracefulShutdownTimeout")
-                       GracefulShutdownTimeout gracefulShutdownTimeout,
+                               GracefulShutdownTimeout gracefulShutdownTimeout,
                        @JsonProperty("webAppEnabled") Boolean webAppEnabled,
+                       @JsonProperty("webAppSessionTimeoutMillis") Long webAppSessionTimeoutMillis,
                        @JsonProperty("mirroringEnabled") Boolean mirroringEnabled,
                        @JsonProperty("numMirroringThreads") Integer numMirroringThreads,
                        @JsonProperty("maxNumFilesPerMirror") Integer maxNumFilesPerMirror,
                        @JsonProperty("maxNumBytesPerMirror") Long maxNumBytesPerMirror,
                        @JsonProperty("replication") ReplicationConfig replicationConfig,
-                       @JsonProperty("securityEnabled") Boolean securityEnabled) {
+                       @JsonProperty("securityEnabled") Boolean securityEnabled,
+                       @JsonProperty("csrfTokenRequiredForThrift") Boolean csrfTokenRequiredForThrift,
+                       @JsonProperty("accessLogFormat") String accessLogFormat,
+                       @JsonProperty("administrators") Set<String> administrators) {
 
         this.dataDir = requireNonNull(dataDir, "dataDir");
         this.ports = ImmutableList.copyOf(requireNonNull(ports, "ports"));
         checkArgument(!ports.isEmpty(), "ports must have at least one port.");
+        this.tls = tls;
         this.numWorkers = numWorkers;
 
         this.maxNumConnections = maxNumConnections;
@@ -127,6 +146,10 @@ final class CentralDogmaConfig {
                       "numRepositoryWorkers: %s (expected: > 0)", this.numRepositoryWorkers);
         this.cacheSpec = RepositoryCache.validateCacheSpec(firstNonNull(cacheSpec, DEFAULT_CACHE_SPEC));
         this.webAppEnabled = firstNonNull(webAppEnabled, true);
+        this.webAppSessionTimeoutMillis = firstNonNull(webAppSessionTimeoutMillis,
+                                                       DEFAULT_WEB_APP_SESSION_TIMEOUT_MILLIS);
+        checkArgument(this.webAppSessionTimeoutMillis > 0,
+                      "webAppSessionTimeoutMillis: %s (expected: > 0)", this.webAppSessionTimeoutMillis);
         this.mirroringEnabled = firstNonNull(mirroringEnabled, true);
         this.numMirroringThreads = firstNonNull(numMirroringThreads, DEFAULT_NUM_MIRRORING_THREADS);
         checkArgument(this.numMirroringThreads > 0,
@@ -140,6 +163,10 @@ final class CentralDogmaConfig {
         this.gracefulShutdownTimeout = gracefulShutdownTimeout;
         this.replicationConfig = firstNonNull(replicationConfig, ReplicationConfig.NONE);
         this.securityEnabled = firstNonNull(securityEnabled, false);
+        this.csrfTokenRequiredForThrift = firstNonNull(csrfTokenRequiredForThrift, true);
+        this.accessLogFormat = accessLogFormat;
+        this.administrators = administrators != null ? ImmutableSet.copyOf(administrators)
+                                                     : ImmutableSet.of();
     }
 
     @JsonProperty
@@ -151,6 +178,12 @@ final class CentralDogmaConfig {
     @JsonSerialize(contentUsing = ServerPortSerializer.class)
     List<ServerPort> ports() {
         return ports;
+    }
+
+    @Nullable
+    @JsonProperty
+    TlsConfig tls() {
+        return tls;
     }
 
     @JsonProperty
@@ -205,6 +238,11 @@ final class CentralDogmaConfig {
     }
 
     @JsonProperty
+    long webAppSessionTimeoutMillis() {
+        return webAppSessionTimeoutMillis;
+    }
+
+    @JsonProperty
     boolean isMirroringEnabled() {
         return mirroringEnabled;
     }
@@ -232,6 +270,20 @@ final class CentralDogmaConfig {
     @JsonProperty
     boolean isSecurityEnabled() {
         return securityEnabled;
+    }
+
+    @JsonProperty
+    boolean isCsrfTokenRequiredForThrift() {
+        return csrfTokenRequiredForThrift;
+    }
+
+    @JsonProperty
+    String accessLogFormat() {
+        return accessLogFormat;
+    }
+
+    Set<String> administrators() {
+        return administrators;
     }
 
     @Override
@@ -316,7 +368,8 @@ final class CentralDogmaConfig {
         }
 
         private static ServerPort fail(DeserializationContext ctx, JsonNode root) throws JsonMappingException {
-            throw ctx.mappingException("invalid server port information: " + root);
+            ctx.reportInputMismatch(ServerPort.class, "invalid server port information: %s", root);
+            throw new Error(); // Should never reach here.
         }
     }
 

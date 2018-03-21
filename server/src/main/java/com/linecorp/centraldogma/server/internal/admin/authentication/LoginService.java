@@ -20,17 +20,24 @@ import static com.google.common.base.Preconditions.checkArgument;
 import static com.linecorp.armeria.common.util.Functions.voidFunction;
 import static java.util.Objects.requireNonNull;
 
+import java.util.concurrent.CompletableFuture;
+
+import org.apache.shiro.authc.IncorrectCredentialsException;
 import org.apache.shiro.authc.UsernamePasswordToken;
-import org.apache.shiro.mgt.SecurityManager;
-import org.apache.shiro.subject.SimplePrincipalCollection;
+import org.apache.shiro.session.mgt.SimpleSession;
 import org.apache.shiro.subject.Subject;
+import org.apache.shiro.util.ThreadContext;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import com.linecorp.armeria.common.HttpRequest;
-import com.linecorp.armeria.common.HttpResponseWriter;
+import com.linecorp.armeria.common.HttpResponse;
 import com.linecorp.armeria.common.HttpStatus;
 import com.linecorp.armeria.common.MediaType;
 import com.linecorp.armeria.server.AbstractHttpService;
 import com.linecorp.armeria.server.ServiceRequestContext;
+import com.linecorp.centraldogma.server.internal.command.Command;
+import com.linecorp.centraldogma.server.internal.command.CommandExecutor;
 
 import io.netty.handler.codec.http.QueryStringDecoder;
 
@@ -39,15 +46,19 @@ import io.netty.handler.codec.http.QueryStringDecoder;
  */
 public class LoginService extends AbstractHttpService {
 
-    private final SecurityManager securityManager;
+    private static final Logger logger = LoggerFactory.getLogger(LoginService.class);
 
-    public LoginService(SecurityManager securityManager) {
+    private final CentralDogmaSecurityManager securityManager;
+    private final CommandExecutor executor;
+
+    public LoginService(CentralDogmaSecurityManager securityManager, CommandExecutor executor) {
         this.securityManager = requireNonNull(securityManager, "securityManager");
+        this.executor = requireNonNull(executor, "executor");
     }
 
     @Override
-    protected void doPost(ServiceRequestContext ctx, HttpRequest req,
-                          HttpResponseWriter res) throws Exception {
+    protected HttpResponse doPost(ServiceRequestContext ctx, HttpRequest req) throws Exception {
+        final CompletableFuture<HttpResponse> future = new CompletableFuture<>();
         req.aggregate().thenAccept(aMsg -> {
             final QueryStringDecoder decoder =
                     new QueryStringDecoder(aMsg.content().toStringUtf8(), false);
@@ -59,24 +70,44 @@ public class LoginService extends AbstractHttpService {
             checkArgument(password != null, "Parameter password should not be null.");
 
             ctx.blockingTaskExecutor().execute(() -> {
+                // Need to set the thread-local security manager to silence
+                // the UnavailableSecurityManagerException logged at DEBUG level.
+                ThreadContext.bind(securityManager);
                 Subject currentUser = null;
+                boolean success = false;
                 try {
-                    currentUser = new Subject.Builder(securityManager)
-                            .principals(new SimplePrincipalCollection(username, username))
-                            .buildSubject();
-
-                    final String sessionId = currentUser.getSession().getId().toString();
+                    currentUser = new Subject.Builder(securityManager).buildSubject();
                     currentUser.login(new UsernamePasswordToken(username, password, rememberMe));
 
-                    res.respond(HttpStatus.OK, MediaType.PLAIN_TEXT_UTF_8, sessionId);
-                } catch (Exception e) {
-                    if (currentUser != null) {
-                        // To delete unnecessary session from Central Dogma session storage.
-                        currentUser.logout();
+                    final String sessionId = currentUser.getSession(false).getId().toString();
+                    final SimpleSession session = securityManager.getSerializableSession(sessionId);
+                    executor.execute(Command.createSession(session)).join();
+                    success = true;
+
+                    logger.info("{} Logged in: {} ({})", ctx, username, sessionId);
+                    future.complete(HttpResponse.of(HttpStatus.OK, MediaType.PLAIN_TEXT_UTF_8, sessionId));
+                } catch (IncorrectCredentialsException e) {
+                    // Not authorized
+                    logger.debug("{} Incorrect login: {}", ctx, username);
+                    future.complete(HttpResponse.of(HttpStatus.UNAUTHORIZED));
+                } catch (Throwable t) {
+                    logger.warn("{} Failed to authenticate: {}", ctx, username, t);
+                    future.complete(HttpResponse.of(HttpStatus.INTERNAL_SERVER_ERROR));
+                } finally {
+                    try {
+                        if (!success && currentUser != null) {
+                            // Delete failed session.
+                            currentUser.logout();
+                        }
+                    } finally {
+                        ThreadContext.unbindSecurityManager();
                     }
-                    res.respond(HttpStatus.UNAUTHORIZED);
                 }
             });
-        }).exceptionally(voidFunction(unused -> res.respond(HttpStatus.UNAUTHORIZED)));
+        }).exceptionally(voidFunction(cause -> {
+            logger.warn("{} Unexpected exception:", ctx, cause);
+            future.complete(HttpResponse.of(HttpStatus.INTERNAL_SERVER_ERROR));
+        }));
+        return HttpResponse.from(future);
     }
 }

@@ -20,6 +20,7 @@ defaults:
           "protocol": "http"
         }
       ],
+      "tls": null,
       "numWorkers": null,
       "maxNumConnections": null,
       "requestTimeoutMillis": null,
@@ -28,6 +29,7 @@ defaults:
       "numRepositoryWorkers": 16,
       "cacheSpec": "maximumWeight=134217728,expireAfterAccess=5m",
       "webAppEnabled": true,
+      "webAppSessionTimeoutMillis": 604800000,
       "gracefulShutdownTimeout": {
         "quietPeriodMillis": 1000,
         "timeoutMillis": 10000
@@ -39,7 +41,9 @@ defaults:
       "mirroringEnabled": true,
       "numMirroringThreads": null,
       "maxNumFilesPerMirror": null,
-      "maxNumBytesPerMirror": null
+      "maxNumBytesPerMirror": null,
+      "accessLogFormat": "common",
+      "administrators": []
     }
 
 Core properties
@@ -64,7 +68,12 @@ Core properties
 
   - ``protocol`` (string)
 
-    - the protocol. ``http`` is the only supported protocol at the moment.
+    - the protocol. ``http`` and ``https`` are supported.
+
+- ``tls``
+
+  - the configuration for Transport Layer Security(TLS) support. Specify ``null`` to disable TLS.
+    See :ref:`tls` for more information.
 
 - ``numWorkers`` (integer)
 
@@ -112,6 +121,11 @@ Core properties
 
   - whether to enable the web-based administrative console. Enabled by default.
 
+- ``webAppSessionTimeoutMillis`` (integer)
+
+  - the session timeout for web-based administrative console, in milliseconds. If ``null``, the default value
+    of '604800000 milliseconds' (7 days) is used.
+
 - ``gracefulShutdownTimeout``
 
   - the amount of time to wait after the initiation of shutdown procedure for requests to go away before
@@ -132,15 +146,15 @@ Core properties
   - the replication configuration.
   - ``method`` (string)
 
-    - the replication method. ``NONE`` indicates 'standalone mode' without replication. ZooKeeper-based
-      multi-master replication will be explained later in this page.
+    - the replication method. ``NONE`` indicates 'standalone mode' without replication. See :ref:`replication`
+      to learn how to configure ZooKeeper-based multi-master replication.
 
 - ``securityEnabled`` (boolean)
 
   - whether to enable authentication. It's disabled by default so that a user can play with Central Dogma
     without hassle. However, it is strongly encouraged to enable authentication because the authorship of
     a commit is filled in automatically based on the principal of the current user. Central Dogma uses
-    `Apache Shiro`_ as its authentication layer and uses the ``conf/security.ini`` file as its security
+    `Apache Shiro`_ as its authentication layer and uses the ``conf/shiro.ini`` file as its security
     configuration. For more information about how to configure `Apache Shiro`_, read
     `this page <https://shiro.apache.org/configuration.html#ini-sections>`_ or check the example configuration
     files under the ``conf/`` directory in the distribution.
@@ -166,6 +180,20 @@ Core properties
   - the maximum allowed number of bytes in a mirror. If the total size of the files in a Git repository exceeds
     this, Central Dogma will reject to mirror the Git repository. If ``null``, the default value of
     '33554432 bytes' (32 MiB) is used.
+
+- ``accessLogFormat`` (string)
+
+  - the format to be used for writing an access log. ``common`` and ``combined`` are pre-defined for NCSA
+    common log format and NCSA combined log format, respectively. Also, a custom log format can be specified
+    here. Read `Writing an access log <https://line.github.io/armeria/server-access-log.html>`_ for more
+    information. Specify ``null`` to disable access logging feature.
+
+- ``administrators`` (set of string)
+
+  - login IDs of the administrators. They are valid only if ``securityEnabled`` is ``true``.
+    Please refer to :ref:`auth` for more information.
+
+.. _replication:
 
 Configuring replication
 -----------------------
@@ -195,6 +223,7 @@ Once you have an access to a ZooKeeper cluster, update the ``replication`` secti
           "protocol": "http"
         }
       ],
+      "tls": null,
       "numWorkers": null,
       "maxNumConnections": null,
       "requestTimeoutMillis": null,
@@ -203,13 +232,13 @@ Once you have an access to a ZooKeeper cluster, update the ``replication`` secti
       "numRepositoryWorkers": 16,
       "cacheSpec": "maximumWeight=134217728,expireAfterAccess=5m",
       "webAppEnabled": true,
+      "webAppSessionTimeoutMillis": 604800000,
       "gracefulShutdownTimeout": {
         "quietPeriodMillis": 1000,
         "timeoutMillis": 10000
       },
       "replication" : {
         "method" : "ZOOKEEPER",
-        "replicaId": "<replicaId>",
         "connectionString": "zk1.example.com:2181,zk2.example.com:2181,zk3.example.com:2181",
         "pathPrefix": "/service/centraldogma",
         "timeoutMillis": null,
@@ -217,17 +246,14 @@ Once you have an access to a ZooKeeper cluster, update the ``replication`` secti
         "maxLogCount": null,
         "minLogAgeMillis": null
       },
-      "securityEnabled": false
+      "securityEnabled": false,
+      "accessLogFormat": "common",
+      "administrators": []
     }
 
 - ``method`` (string)
 
   - the replication method. ``ZOOKEEPER`` indicates ZooKeeper-based multi-master replication.
-
-- ``replicaId`` (string)
-
-  - the unique and unchanging ID of the replica, e.g. `UUID <https://www.uuidgenerator.net/>`_
-  - Be extra cautious so that the replica IDs do not change or duplicate.
 
 - ``connectionString`` (string)
 
@@ -258,3 +284,83 @@ Once you have an access to a ZooKeeper cluster, update the ``replication`` secti
 
   -  the minimum allowed age of log items before they are removed from ZooKeeper. If ``null`` the default
      value of '3600000 milliseconds' (1 hour) is used.
+
+.. _tls:
+
+Configuring TLS
+---------------
+Central Dogma supports TLS for its API and web pages. To enable TLS, a user may configure ``tls`` property
+in ``dogma.json`` as follows.
+
+.. code-block:: json
+
+    {
+      "dataDir": "./data",
+      "ports": [
+        {
+          "localAddress": {
+            "host": "*",
+            "port": 36462
+          },
+          "protocol": "https"
+        }
+      ],
+      "tls": {
+        "keyCertChainFile": "./cert/centraldogma.crt",
+        "keyFile": "./cert/centraldogma.key",
+        "keyPassword": null
+      },
+      "numWorkers": null,
+      "maxNumConnections": null,
+      "requestTimeoutMillis": null,
+      "idleTimeoutMillis": null,
+      "maxFrameLength": null,
+      "numRepositoryWorkers": 16,
+      "cacheSpec": "maximumWeight=134217728,expireAfterAccess=5m",
+      "webAppEnabled": true,
+      "gracefulShutdownTimeout": {
+        "quietPeriodMillis": 1000,
+        "timeoutMillis": 10000
+      },
+      "replication": {
+        "method": "NONE"
+      },
+      "securityEnabled": false,
+      "mirroringEnabled": true,
+      "numMirroringThreads": null,
+      "maxNumFilesPerMirror": null,
+      "maxNumBytesPerMirror": null,
+      "accessLogFormat": "common"
+    }
+
+- ``tls``
+
+  - the configuration for TLS support. It will be applied to the port which is configured with ``https``
+    protocol. If ``null``, a self-signed certificate will be generated for ``https`` protocol.
+  - ``keyCertChainFile`` (string)
+
+    - the path to the certificate chain file.
+
+  - ``keyFile`` (string)
+
+    - the path to the private key file.
+
+  - ``keyPassword`` (string)
+
+    - the password of the private key file. Specify ``null`` if no password is set. Note that ``null``
+      (no password) and ``"null"`` (password is 'null') are different.
+
+If you run your Central Dogma with TLS, you need to enable TLS of your ``CentralDogma`` client instance.
+You can get it by ``CentralDogma.forTlsHost()`` methods.
+
+.. code-block:: java
+
+    CentralDogma dogma = CentralDogma.forTlsHost("centraldogma.example.com", 36462);
+
+Also, ``CentralDogmaBuilder`` provides ``useTls()`` method.
+
+.. code-block:: java
+
+    CentralDogma dogma = new CentralDogmaBuilder().host("centraldogma.example.com", 36462)
+                                                  .useTls()
+                                                  .build();

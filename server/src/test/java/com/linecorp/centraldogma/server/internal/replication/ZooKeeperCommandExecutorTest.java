@@ -21,7 +21,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
-import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.timeout;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -34,6 +34,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Function;
 
@@ -87,7 +88,7 @@ public class ZooKeeperCommandExecutorTest {
         Replica replica4 = null;
 
         try {
-            final Command<Void> command1 = Command.createRepository("project", "repo1");
+            final Command<Void> command1 = Command.createRepository(Author.SYSTEM, "project", "repo1");
             replica1.rm.execute(command1).join();
 
             final Optional<ReplicationLog<?>> commandResult2 = replica1.rm.loadLog(0, false);
@@ -95,9 +96,9 @@ public class ZooKeeperCommandExecutorTest {
             assertThat(commandResult2.get().result()).isNull();
 
             Thread.sleep(100);
-            verify(replica1.delegate, times(1)).apply(eq(command1));
-            verify(replica2.delegate, times(1)).apply(eq(command1));
-            verify(replica3.delegate, times(1)).apply(eq(command1));
+            verify(replica1.delegate, timeout(300).times(1)).apply(eq(command1));
+            verify(replica2.delegate, timeout(300).times(1)).apply(eq(command1));
+            verify(replica3.delegate, timeout(300).times(1)).apply(eq(command1));
 
             assertThat(replica1.localRevision()).isEqualTo(0L);
             assertThat(replica2.localRevision()).isEqualTo(0L);
@@ -106,26 +107,23 @@ public class ZooKeeperCommandExecutorTest {
             //stop replay m3
             replica3.rm.stop();
 
-            final Command<?> command2 = Command.createProject("foo");
+            final Command<?> command2 = Command.createProject(Author.SYSTEM, "foo");
             replica1.rm.execute(command2).join();
-            Thread.sleep(100);
-            verify(replica1.delegate, times(1)).apply(eq(command2));
-            verify(replica2.delegate, times(1)).apply(eq(command2));
-            verify(replica3.delegate, times(0)).apply(eq(command2));
+            verify(replica1.delegate, timeout(300).times(1)).apply(eq(command2));
+            verify(replica2.delegate, timeout(300).times(1)).apply(eq(command2));
+            verify(replica3.delegate, timeout(300).times(0)).apply(eq(command2));
 
             //start replay m3 with new object
             newReplica3 = new Replica("m3", ROOT);
-            Thread.sleep(100);
-            verify(newReplica3.delegate, times(1)).apply(eq(command2));
+            verify(newReplica3.delegate, timeout(TimeUnit.SECONDS.toMillis(2)).times(1)).apply(eq(command1));
+            verify(newReplica3.delegate, timeout(TimeUnit.SECONDS.toMillis(2)).times(1)).apply(eq(command2));
 
             replica4 = new Replica("m4", ROOT);
-            Thread.sleep(100);
-            verify(replica4.delegate, times(1)).apply(eq(command1));
-            verify(replica4.delegate, times(1)).apply(eq(command2));
+            verify(replica4.delegate, timeout(TimeUnit.SECONDS.toMillis(2)).times(1)).apply(eq(command1));
+            verify(replica4.delegate, timeout(TimeUnit.SECONDS.toMillis(2)).times(1)).apply(eq(command2));
         } finally {
             replica1.rm.stop();
             replica2.rm.stop();
-            replica3.rm.stop();
             if (newReplica3 != null) {
                 newReplica3.rm.stop();
             }
@@ -174,7 +172,7 @@ public class ZooKeeperCommandExecutorTest {
 
         try {
             final Command<Revision> command =
-                    Command.push("foo", "bar", Revision.HEAD, Author.SYSTEM, "", "", Markup.PLAINTEXT);
+                    Command.push(Author.SYSTEM, "foo", "bar", Revision.HEAD, "", "", Markup.PLAINTEXT);
 
             final int COMMANDS_PER_REPLICA = 3;
             final List<CompletableFuture<Void>> futures = new ArrayList<>(replicas.length);
@@ -210,6 +208,13 @@ public class ZooKeeperCommandExecutorTest {
         }
     }
 
+    private static Function<Command<?>, CompletableFuture<?>> newMockDelegate() {
+        @SuppressWarnings("unchecked")
+        final Function<Command<?>, CompletableFuture<?>> delegate = mock(Function.class);
+        when(delegate.apply(any())).thenReturn(completedFuture(null));
+        return delegate;
+    }
+
     private final class Replica {
 
         private final ZooKeeperCommandExecutor rm;
@@ -218,8 +223,7 @@ public class ZooKeeperCommandExecutorTest {
 
         @SuppressWarnings("unchecked")
         Replica(String id, String zkPath) throws Exception {
-            this(id, zkPath, mock(Function.class));
-            when(delegate.apply(any())).thenReturn(completedFuture(null));
+            this(id, zkPath, newMockDelegate());
         }
 
         Replica(String id, String zkPath,
@@ -240,7 +244,7 @@ public class ZooKeeperCommandExecutorTest {
 
                             @Override
                             @SuppressWarnings("unchecked")
-                            protected <T> CompletableFuture<T> doExecute(Command<T> command) {
+                            protected <T> CompletableFuture<T> doExecute(String replicaId, Command<T> command) {
                                 return (CompletableFuture<T>) delegate.apply(command);
                             }
                         })

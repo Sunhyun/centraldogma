@@ -9,6 +9,7 @@
       "protocol": "http"
     }
   ],
+  "tls": null,
   "numWorkers": null,
   "maxNumConnections": null,
   "requestTimeoutMillis": null,
@@ -17,6 +18,7 @@
   "numRepositoryWorkers": 16,
   "cacheSpec": "maximumWeight=134217728,expireAfterAccess=5m",
   "webAppEnabled": true,
+  "webAppSessionTimeoutMillis": 604800000,
   "gracefulShutdownTimeout": {
     "quietPeriodMillis": 1000,
     "timeoutMillis": 10000
@@ -24,5 +26,9 @@
   "replication": {
     "method": "NONE"
   },
-  "securityEnabled": false
+  "securityEnabled": false,
+  "accessLogFormat": "common",
+  "administrators": [
+    "admin"
+  ]
 }

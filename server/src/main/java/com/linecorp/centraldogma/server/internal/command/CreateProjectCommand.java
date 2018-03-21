@@ -18,17 +18,23 @@ package com.linecorp.centraldogma.server.internal.command;
 
 import static java.util.Objects.requireNonNull;
 
+import javax.annotation.Nullable;
+
 import com.fasterxml.jackson.annotation.JsonCreator;
 import com.fasterxml.jackson.annotation.JsonProperty;
 import com.google.common.base.MoreObjects.ToStringHelper;
+
+import com.linecorp.centraldogma.common.Author;
 
 public final class CreateProjectCommand extends RootCommand<Void> {
 
     private final String projectName;
 
     @JsonCreator
-    CreateProjectCommand(@JsonProperty("projectName") String projectName) {
-        super(CommandType.CREATE_PROJECT);
+    CreateProjectCommand(@JsonProperty("timestamp") @Nullable Long timestamp,
+                         @JsonProperty("author") @Nullable Author author,
+                         @JsonProperty("projectName") String projectName) {
+        super(CommandType.CREATE_PROJECT, timestamp, author);
         this.projectName = requireNonNull(projectName, "projectName");
     }
 
@@ -59,6 +65,7 @@ public final class CreateProjectCommand extends RootCommand<Void> {
 
     @Override
     ToStringHelper toStringHelper() {
-        return super.toStringHelper().add("projectName", projectName);
+        return super.toStringHelper()
+                    .add("projectName", projectName);
     }
 }

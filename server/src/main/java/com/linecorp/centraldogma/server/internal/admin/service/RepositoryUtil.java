@@ -25,6 +25,7 @@ import com.linecorp.centraldogma.common.Author;
 import com.linecorp.centraldogma.common.Change;
 import com.linecorp.centraldogma.common.Markup;
 import com.linecorp.centraldogma.common.Revision;
+import com.linecorp.centraldogma.server.internal.api.AbstractService;
 import com.linecorp.centraldogma.server.internal.command.Command;
 import com.linecorp.centraldogma.server.internal.storage.project.ProjectManager;
 
@@ -57,7 +58,7 @@ final class RepositoryUtil {
 
         return f.thenCompose(
                 changes -> service.execute(
-                        Command.push(projectName, repositoryName, normalizedRev, author,
+                        Command.push(author, projectName, repositoryName, normalizedRev,
                                      commitSummary, commitDetail, commitMarkup, changes.values())));
     }
 

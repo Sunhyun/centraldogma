@@ -1,4 +1,19 @@
 /*
+ * Copyright 2017 LINE Corporation
+ *
+ * LINE Corporation licenses this file to you under the Apache License,
+ * version 2.0 (the "License"); you may not use this file except in compliance
+ * with the License. You may obtain a copy of the License at:
+ *
+ *   https://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ * License for the specific language governing permissions and limitations
+ * under the License.
+ */
+/*
  * Copyright (c) 2014, Francis Galiegue (fgaliegue@gmail.com)
  *
  * This software is dual-licensed under:
@@ -20,12 +35,12 @@
 package com.linecorp.centraldogma.internal.jsonpatch;
 
 import static org.testng.Assert.assertEquals;
-import static org.testng.Assert.assertNotSame;
 import static org.testng.Assert.assertTrue;
 import static org.testng.Assert.fail;
 
 import java.io.IOException;
 import java.net.URL;
+import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.List;
 
@@ -36,25 +51,19 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.ObjectReader;
 import com.google.common.base.Equivalence;
-import com.google.common.collect.Lists;
-
-import com.linecorp.centraldogma.internal.jsonpatch.utils.JsonNumEquals;
 
 @Test
-public abstract class JsonPatchOperationTest
-{
-    private static final Equivalence<JsonNode> EQUIVALENCE
-        = JsonNumEquals.getInstance();
+public abstract class JsonPatchOperationTest {
+
+    private static final Equivalence<JsonNode> EQUIVALENCE = JsonNumEquals.getInstance();
 
     private final JsonNode errors;
     private final JsonNode ops;
     private final ObjectReader reader;
 
-    protected JsonPatchOperationTest(final String prefix)
-        throws IOException
-    {
+    protected JsonPatchOperationTest(final String prefix) throws IOException {
         final String resource = "/jsonpatch/" + prefix + ".json";
-        URL url = this.getClass().getResource(resource);
+        URL url = getClass().getResource(resource);
         ObjectMapper objectMapper = new ObjectMapper();
         final JsonNode node = objectMapper.readTree(url);
         errors = node.get("errors");
@@ -63,28 +72,25 @@ public abstract class JsonPatchOperationTest
     }
 
     @DataProvider
-    public final Iterator<Object[]> getErrors()
-        throws NoSuchFieldException, IllegalAccessException
-    {
-        final List<Object[]> list = Lists.newArrayList();
+    public final Iterator<Object[]> getErrors() throws NoSuchFieldException, IllegalAccessException {
+        final List<Object[]> list = new ArrayList<>();
 
-        for (final JsonNode node: errors)
-            list.add(new Object[]{
-                node.get("op"),
-                node.get("node"),
-                node.get("message").textValue()
+        for (final JsonNode node : errors) {
+            list.add(new Object[] {
+                    node.get("op"),
+                    node.get("node"),
+                    node.get("message").textValue()
             });
+        }
 
         return list.iterator();
     }
 
     @Test(dataProvider = "getErrors")
-    public final void errorsAreCorrectlyReported(final JsonNode patch,
-        final JsonNode node, final String message)
-        throws IOException
-    {
-        final JsonPatchOperation op = reader.readValue(patch);
+    public final void errorsAreCorrectlyReported(final JsonNode patch, final JsonNode node,
+                                                 final String message) throws IOException {
 
+        final JsonPatchOperation op = reader.readValue(patch);
         try {
             op.apply(node);
             fail("No exception thrown!!");
@@ -94,34 +100,27 @@ public abstract class JsonPatchOperationTest
     }
 
     @DataProvider
-    public final Iterator<Object[]> getOps()
-    {
-        final List<Object[]> list = Lists.newArrayList();
-
-        for (final JsonNode node: ops)
-            list.add(new Object[]{
-                node.get("op"),
-                node.get("node"),
-                node.get("expected")
+    public final Iterator<Object[]> getOps() {
+        final List<Object[]> list = new ArrayList<>();
+        for (final JsonNode node : ops) {
+            list.add(new Object[] {
+                    node.get("op"),
+                    node.get("node"),
+                    node.get("expected")
             });
+        }
 
         return list.iterator();
     }
 
     @Test(dataProvider = "getOps")
-    public final void operationsYieldExpectedResults(final JsonNode patch,
-        final JsonNode node, final JsonNode expected)
-        throws IOException, JsonPatchException
-    {
+    public final void operationsYieldExpectedResults(
+            final JsonNode patch, final JsonNode node, final JsonNode expected) throws IOException {
         final JsonPatchOperation op = reader.readValue(patch);
-        final JsonNode actual = op.apply(node);
+        final JsonNode actual = op.apply(node.deepCopy());
 
         assertTrue(EQUIVALENCE.equivalent(actual, expected),
-            "patched node differs from expectations: expected " + expected
-            + " but found " + actual);
-        if (EQUIVALENCE.equivalent(node, actual) && node.isContainerNode())
-            assertNotSame(node, actual,
-                "operation didn't make a copy of the input node");
+                   "patched node differs from expectations: expected " + expected +
+                   " but found " + actual);
     }
 }
-

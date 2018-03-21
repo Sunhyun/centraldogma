@@ -21,14 +21,15 @@ import static java.util.Objects.requireNonNull;
 
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
 import java.util.concurrent.CompletableFuture;
-import java.util.function.BiFunction;
+import java.util.concurrent.CompletionException;
 import java.util.function.Function;
 
 import javax.annotation.Nullable;
 
 import com.github.benmanes.caffeine.cache.AsyncLoadingCache;
+import com.google.common.base.Throwables;
+import com.spotify.futures.CompletableFutures;
 
 import com.linecorp.centraldogma.common.Author;
 import com.linecorp.centraldogma.common.Change;
@@ -38,6 +39,8 @@ import com.linecorp.centraldogma.common.Markup;
 import com.linecorp.centraldogma.common.Query;
 import com.linecorp.centraldogma.common.QueryResult;
 import com.linecorp.centraldogma.common.Revision;
+import com.linecorp.centraldogma.common.RevisionRange;
+import com.linecorp.centraldogma.server.internal.storage.StorageException;
 import com.linecorp.centraldogma.server.internal.storage.project.Project;
 import com.linecorp.centraldogma.server.internal.storage.repository.FindOption;
 import com.linecorp.centraldogma.server.internal.storage.repository.Repository;
@@ -45,15 +48,34 @@ import com.linecorp.centraldogma.server.internal.storage.repository.Repository;
 final class CachingRepository implements Repository {
 
     private final Repository repo;
-    private volatile Revision headRevision;
 
     @SuppressWarnings("rawtypes")
     private final AsyncLoadingCache<CacheableCall, Object> cache;
 
+    private final Commit firstCommit;
+
     CachingRepository(Repository repo, RepositoryCache cache) {
         this.repo = requireNonNull(repo, "repo");
         this.cache = requireNonNull(cache, "cache").cache;
-        repo.normalize(Revision.HEAD).thenAccept(headRevision -> this.headRevision = headRevision);
+
+        try {
+            final List<Commit> history = repo.history(Revision.INIT, Revision.INIT, ALL_PATH, 1).join();
+            firstCommit = history.get(0);
+        } catch (CompletionException e) {
+            final Throwable cause = Throwables.getRootCause(e);
+            Throwables.throwIfUnchecked(cause);
+            throw new StorageException("failed to retrieve the initial commit", cause);
+        }
+    }
+
+    @Override
+    public long creationTimeMillis() {
+        return firstCommit.when();
+    }
+
+    @Override
+    public Author author() {
+        return firstCommit.author();
     }
 
     @Override
@@ -93,25 +115,19 @@ final class CachingRepository implements Repository {
             throw new IllegalArgumentException("maxCommits: " + maxCommits + " (expected: > 0)");
         }
 
-        if (!from.onMainLane() || !to.onMainLane()) {
-            // Do not cache non-mainlane requests.
-            return repo.history(from, to, pathPattern, maxCommits);
+        final RevisionRange range;
+        try {
+            range = normalizeNow(from, to);
+        } catch (Exception e) {
+            return CompletableFutures.exceptionallyCompletedFuture(e);
         }
 
-        final CompletableFuture<Object> future = normalizeAndCompose(
-                from, to,
-                (normalizedFrom, normalizedTo) -> {
-                    // Make sure maxCommits do not exceed its theoretical limit to increase the chance of
-                    // cache hit.
-                    // e.g. when from = 2 and to = 4, the same result should be yielded when maxCommits >= 3.
-                    final int actualMaxCommits =
-                            Math.min(maxCommits, Math.abs(normalizedFrom.major() - normalizedTo.major()) + 1);
-
-                    return cache.get(new CacheableHistoryCall(repo, normalizedFrom, normalizedTo,
-                                                              pathPattern, actualMaxCommits));
-                });
-
-        return unsafeCast(future);
+        // Make sure maxCommits do not exceed its theoretical limit to increase the chance of cache hit.
+        // e.g. when from = 2 and to = 4, the same result should be yielded when maxCommits >= 3.
+        final int actualMaxCommits = Math.min(
+                maxCommits, Math.abs(range.from().major() - range.to().major()) + 1);
+        return unsafeCast(cache.get(
+                new CacheableHistoryCall(repo, range.from(), range.to(), pathPattern, actualMaxCommits)));
     }
 
     @Override
@@ -120,12 +136,14 @@ final class CachingRepository implements Repository {
         requireNonNull(to, "to");
         requireNonNull(query, "query");
 
-        final CompletableFuture<Object> future = normalizeAndCompose(
-                from, to,
-                (normalizedFrom, normalizedTo) ->
-                        cache.get(new CacheableSingleDiffCall(repo, normalizedFrom, normalizedTo, query)));
+        final RevisionRange range;
+        try {
+            range = normalizeNow(from, to).toAscending();
+        } catch (Exception e) {
+            return CompletableFutures.exceptionallyCompletedFuture(e);
+        }
 
-        return unsafeCast(future);
+        return unsafeCast(cache.get(new CacheableSingleDiffCall(repo, range.from(), range.to(), query)));
     }
 
     @Override
@@ -134,12 +152,14 @@ final class CachingRepository implements Repository {
         requireNonNull(to, "to");
         requireNonNull(pathPattern, "pathPattern");
 
-        final CompletableFuture<Object> future = normalizeAndCompose(
-                from, to,
-                (normalizedFrom, normalizedTo) ->
-                        cache.get(new CacheableMultiDiffCall(repo, normalizedFrom, normalizedTo, pathPattern)));
+        final RevisionRange range;
+        try {
+            range = normalizeNow(from, to).toAscending();
+        } catch (Exception e) {
+            return CompletableFutures.exceptionallyCompletedFuture(e);
+        }
 
-        return unsafeCast(future);
+        return unsafeCast(cache.get(new CacheableMultiDiffCall(repo, range.from(), range.to(), pathPattern)));
     }
 
     // Simple delegations
@@ -155,8 +175,13 @@ final class CachingRepository implements Repository {
     }
 
     @Override
-    public CompletableFuture<Revision> normalize(Revision revision) {
-        return repo.normalize(revision);
+    public Revision normalizeNow(Revision revision) {
+        return repo.normalizeNow(revision);
+    }
+
+    @Override
+    public RevisionRange normalizeNow(Revision from, Revision to) {
+        return repo.normalizeNow(from, to);
     }
 
     @Override
@@ -167,50 +192,20 @@ final class CachingRepository implements Repository {
     }
 
     @Override
-    public CompletableFuture<Revision> commit(
-            Revision baseRevision, Author author, String summary,
-            String detail, Markup markup, Iterable<Change<?>> changes) {
+    public CompletableFuture<Revision> commit(Revision baseRevision, long commitTimeMillis,
+                                              Author author, String summary, String detail, Markup markup,
+                                              Iterable<Change<?>> changes) {
 
-        return repo.commit(baseRevision, author, summary, detail, markup, changes);
+        return repo.commit(baseRevision, commitTimeMillis, author, summary, detail, markup, changes);
     }
 
     @Override
-    public CompletableFuture<Revision> watch(Revision lastKnownRev, String pathPattern) {
-        return repo.watch(lastKnownRev, pathPattern);
-    }
-
-    @Override
-    public CompletableFuture<Revision> createRunspace(Author author, int majorRevision) {
-        return repo.createRunspace(author, majorRevision);
-    }
-
-    @Override
-    public CompletableFuture<Void> removeRunspace(int majorRevision) {
-        return repo.removeRunspace(majorRevision);
-    }
-
-    @Override
-    public CompletableFuture<Set<Revision>> listRunspaces() {
-        return repo.listRunspaces();
+    public CompletableFuture<Revision> watch(Revision lastKnownRevision, String pathPattern) {
+        return repo.watch(lastKnownRevision, pathPattern);
     }
 
     private <T> CompletableFuture<T> normalizeAndCompose(
             Revision revision, Function<Revision, CompletableFuture<T>> function) {
         return normalize(revision).thenCompose(function);
-    }
-
-    private <T> CompletableFuture<T> normalizeAndCompose(
-            Revision from, Revision to, BiFunction<Revision, Revision, CompletableFuture<T>> function) {
-        final CompletableFuture<Revision> normalizeFromFuture = normalize(from);
-        final CompletableFuture<Revision> normalizeToFuture = normalize(to);
-        assert normalizeFromFuture != null;
-        assert normalizeToFuture != null;
-
-        return CompletableFuture.allOf(
-                normalizeFromFuture, normalizeToFuture).thenCompose(unused -> {
-            final Revision normalizedFrom = normalizeFromFuture.join();
-            final Revision normalizedTo = normalizeToFuture.join();
-            return function.apply(normalizedFrom, normalizedTo);
-        });
     }
 }

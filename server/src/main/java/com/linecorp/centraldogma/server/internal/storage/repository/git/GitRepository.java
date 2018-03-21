@@ -16,25 +16,33 @@
 
 package com.linecorp.centraldogma.server.internal.storage.repository.git;
 
+import static com.google.common.base.Preconditions.checkState;
+import static java.nio.charset.StandardCharsets.UTF_8;
 import static java.util.Objects.requireNonNull;
+import static org.eclipse.jgit.lib.ConfigConstants.CONFIG_CORE_SECTION;
+import static org.eclipse.jgit.lib.ConfigConstants.CONFIG_DIFF_SECTION;
+import static org.eclipse.jgit.lib.ConfigConstants.CONFIG_KEY_ALGORITHM;
+import static org.eclipse.jgit.lib.ConfigConstants.CONFIG_KEY_FILEMODE;
+import static org.eclipse.jgit.lib.ConfigConstants.CONFIG_KEY_HIDEDOTFILES;
+import static org.eclipse.jgit.lib.ConfigConstants.CONFIG_KEY_RENAMES;
+import static org.eclipse.jgit.lib.ConfigConstants.CONFIG_KEY_REPO_FORMAT_VERSION;
+import static org.eclipse.jgit.lib.ConfigConstants.CONFIG_KEY_SYMLINKS;
 
 import java.io.File;
-import java.io.IOError;
 import java.io.IOException;
-import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Collections;
-import java.util.HashMap;
-import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
+import java.util.StringJoiner;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.BiConsumer;
+import java.util.regex.Pattern;
 
 import org.eclipse.jgit.diff.DiffEntry;
 import org.eclipse.jgit.diff.DiffFormatter;
@@ -46,18 +54,20 @@ import org.eclipse.jgit.dircache.DirCacheEditor.DeleteTree;
 import org.eclipse.jgit.dircache.DirCacheEditor.PathEdit;
 import org.eclipse.jgit.dircache.DirCacheEntry;
 import org.eclipse.jgit.dircache.DirCacheIterator;
+import org.eclipse.jgit.internal.storage.file.RefDirectory;
 import org.eclipse.jgit.lib.CommitBuilder;
 import org.eclipse.jgit.lib.Constants;
+import org.eclipse.jgit.lib.CoreConfig.HideDotFiles;
 import org.eclipse.jgit.lib.FileMode;
 import org.eclipse.jgit.lib.ObjectId;
 import org.eclipse.jgit.lib.ObjectInserter;
 import org.eclipse.jgit.lib.ObjectReader;
 import org.eclipse.jgit.lib.PersonIdent;
 import org.eclipse.jgit.lib.Ref;
-import org.eclipse.jgit.lib.RefRename;
 import org.eclipse.jgit.lib.RefUpdate;
 import org.eclipse.jgit.lib.RefUpdate.Result;
 import org.eclipse.jgit.lib.RepositoryBuilder;
+import org.eclipse.jgit.lib.StoredConfig;
 import org.eclipse.jgit.revwalk.RevCommit;
 import org.eclipse.jgit.revwalk.RevTree;
 import org.eclipse.jgit.revwalk.RevWalk;
@@ -72,6 +82,7 @@ import org.slf4j.LoggerFactory;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.MoreObjects;
 
 import com.linecorp.centraldogma.common.Author;
 import com.linecorp.centraldogma.common.Change;
@@ -80,10 +91,11 @@ import com.linecorp.centraldogma.common.Entry;
 import com.linecorp.centraldogma.common.EntryType;
 import com.linecorp.centraldogma.common.Markup;
 import com.linecorp.centraldogma.common.Revision;
+import com.linecorp.centraldogma.common.RevisionRange;
 import com.linecorp.centraldogma.internal.Jackson;
 import com.linecorp.centraldogma.internal.Util;
 import com.linecorp.centraldogma.internal.jsonpatch.JsonPatch;
-import com.linecorp.centraldogma.internal.jsonpatch.JsonPatchException;
+import com.linecorp.centraldogma.internal.jsonpatch.ReplaceMode;
 import com.linecorp.centraldogma.server.internal.storage.StorageException;
 import com.linecorp.centraldogma.server.internal.storage.project.Project;
 import com.linecorp.centraldogma.server.internal.storage.repository.ChangeConflictException;
@@ -94,7 +106,6 @@ import com.linecorp.centraldogma.server.internal.storage.repository.RevisionNotF
 
 import difflib.DiffUtils;
 import difflib.Patch;
-import difflib.PatchFailedException;
 
 /**
  * A {@link Repository} based on Git.
@@ -103,20 +114,18 @@ class GitRepository implements Repository {
 
     private static final Logger logger = LoggerFactory.getLogger(GitRepository.class);
 
+    static final String R_HEADS_MASTER = Constants.R_HEADS + Constants.MASTER;
+
     private static final byte[] EMPTY_BYTE = new byte[0];
-
-    private static final String RUNSPACES = "runspaces/";
-    private static final String RUNSPACES_REMOVED = "runspaces.removed/";
-
-    private static final String R_HEADS_MASTER = Constants.R_HEADS + Constants.MASTER;
-    private static final String R_HEADS_RUNSPACES = Constants.R_HEADS + RUNSPACES;
-    private static final String R_HEADS_RUNSPACES_REMOVED = Constants.R_HEADS + RUNSPACES_REMOVED;
+    private static final Pattern CR = Pattern.compile("\r", Pattern.LITERAL);
 
     private final Lock writeLock = new ReentrantLock();
     private final Project parent;
     private final Executor repositoryWorker;
     private final String name;
     private final org.eclipse.jgit.lib.Repository jGitRepository;
+    private final GitRepositoryFormat format;
+    private final CommitIdDatabase commitIdDatabase;
     private final CommitWatchers commitWatchers = new CommitWatchers();
 
     /**
@@ -129,30 +138,83 @@ class GitRepository implements Repository {
      *
      * @param repoDir the location of this repository
      * @param repositoryWorker the {@link Executor} which will perform the blocking repository operations
+     * @param creationTimeMillis the creation time
      * @param author the user who initiated the creation of this repository
      *
      * @throws StorageException if failed to create a new repository
      */
-    GitRepository(Project parent, File repoDir, Executor repositoryWorker, Author author) {
+    GitRepository(Project parent, File repoDir, Executor repositoryWorker,
+                  long creationTimeMillis, Author author) {
+        this(parent, repoDir, GitRepositoryFormat.V1, repositoryWorker, creationTimeMillis, author);
+    }
+
+    /**
+     * Creates a new Git-backed repository.
+     *
+     * @param repoDir the location of this repository
+     * @param format the repository format
+     * @param repositoryWorker the {@link Executor} which will perform the blocking repository operations
+     * @param creationTimeMillis the creation time
+     * @param author the user who initiated the creation of this repository
+     *
+     * @throws StorageException if failed to create a new repository
+     */
+    GitRepository(Project parent, File repoDir, GitRepositoryFormat format, Executor repositoryWorker,
+                  long creationTimeMillis, Author author) {
+
         this.parent = requireNonNull(parent, "parent");
         name = requireNonNull(repoDir, "repoDir").getName();
         this.repositoryWorker = requireNonNull(repositoryWorker, "repositoryWorker");
+        this.format = requireNonNull(format, "format");
 
         requireNonNull(author, "author");
 
-        RepositoryBuilder repositoryBuilder = new RepositoryBuilder().setGitDir(repoDir).setBare();
+        final RepositoryBuilder repositoryBuilder = new RepositoryBuilder().setGitDir(repoDir).setBare();
         boolean success = false;
         try {
-            jGitRepository = repositoryBuilder.build();
-            if (exist(repoDir)) {
-                throw new StorageException(
-                        "failed to create a repository at: " + repoDir + " (exists already)");
+            // Create an empty repository with format version 0 first.
+            try (org.eclipse.jgit.lib.Repository initRepo = repositoryBuilder.build()) {
+                if (exist(repoDir)) {
+                    throw new StorageException(
+                            "failed to create a repository at: " + repoDir + " (exists already)");
+                }
+
+                initRepo.create(true);
+
+                final StoredConfig config = initRepo.getConfig();
+                if (format == GitRepositoryFormat.V1) {
+                    // Update the repository settings to upgrade to format version 1 and reftree.
+                    config.setInt(CONFIG_CORE_SECTION, null, CONFIG_KEY_REPO_FORMAT_VERSION, 1);
+                }
+
+                // Disable hidden files, symlinks and file modes we do not use.
+                config.setEnum(CONFIG_CORE_SECTION, null, CONFIG_KEY_HIDEDOTFILES, HideDotFiles.FALSE);
+                config.setBoolean(CONFIG_CORE_SECTION, null, CONFIG_KEY_SYMLINKS, false);
+                config.setBoolean(CONFIG_CORE_SECTION, null, CONFIG_KEY_FILEMODE, false);
+
+                // Set the diff algorithm.
+                config.setString(CONFIG_DIFF_SECTION, null, CONFIG_KEY_ALGORITHM, "histogram");
+
+                // Disable rename detection which we do not use.
+                config.setBoolean(CONFIG_DIFF_SECTION, null, CONFIG_KEY_RENAMES, false);
+
+                config.save();
             }
 
-            jGitRepository.create(true);
+            // Re-open the repository with the updated settings and format version.
+            jGitRepository = new RepositoryBuilder().setGitDir(repoDir).build();
 
-            // Insert the initial commit.
-            commit0(null, Revision.INIT, author, "Create a new repository", "", Markup.PLAINTEXT,
+            // Initialize the master branch.
+            final RefUpdate head = jGitRepository.updateRef(Constants.HEAD);
+            head.disableRefLog();
+            head.link(Constants.R_HEADS + Constants.MASTER);
+
+            // Initialize the commit ID database.
+            commitIdDatabase = new CommitIdDatabase(jGitRepository);
+
+            // Insert the initial commit into the master branch.
+            commit0(null, Revision.INIT, creationTimeMillis, author,
+                    "Create a new repository", "", Markup.PLAINTEXT,
                     Collections.emptyList(), true);
 
             headRevision = Revision.INIT;
@@ -161,12 +223,9 @@ class GitRepository implements Repository {
             throw new StorageException("failed to create a repository at: " + repoDir, e);
         } finally {
             if (!success) {
+                close();
                 // Failed to create a repository. Remove any cruft so that it is not loaded on the next run.
-                try {
-                    deltree(repoDir);
-                } catch (IOError e) {
-                    logger.warn("Failed to delete a half-created repository at: {}", repoDir, e);
-                }
+                deleteCruft(repoDir);
             }
         }
     }
@@ -190,11 +249,38 @@ class GitRepository implements Repository {
             if (!exist(repoDir)) {
                 throw new StorageException("failed to open a repository at: " + repoDir + " (does not exist)");
             }
+
+            // Retrieve the tag format.
+            final int formatVersion = jGitRepository.getConfig().getInt(
+                    CONFIG_CORE_SECTION, null, CONFIG_KEY_REPO_FORMAT_VERSION, 0);
+            switch (formatVersion) {
+                case 0:
+                    format = GitRepositoryFormat.V0;
+                    break;
+                case 1:
+                    format = GitRepositoryFormat.V1;
+                    break;
+                default:
+                    throw new StorageException("unknown repository format version: " + formatVersion);
+            }
         } catch (IOException e) {
             throw new StorageException("failed to open a repository at: " + repoDir, e);
         }
 
-        headRevision = uncachedMainLaneHeadRevision();
+        boolean success = false;
+        try {
+            headRevision = uncachedHeadRevision();
+            commitIdDatabase = new CommitIdDatabase(jGitRepository);
+            if (!headRevision.equals(commitIdDatabase.headRevision())) {
+                commitIdDatabase.rebuild(jGitRepository);
+                assert headRevision.equals(commitIdDatabase.headRevision());
+            }
+            success = true;
+        } finally {
+            if (!success) {
+                close();
+            }
+        }
     }
 
     private static boolean exist(File repoDir) {
@@ -202,7 +288,7 @@ class GitRepository implements Repository {
             RepositoryBuilder repositoryBuilder = new RepositoryBuilder().setGitDir(repoDir);
             org.eclipse.jgit.lib.Repository repository = repositoryBuilder.build();
             if (repository.getConfig() instanceof FileBasedConfig) {
-                return ((FileBasedConfig)repository.getConfig()).getFile().exists();
+                return ((FileBasedConfig) repository.getConfig()).getFile().exists();
             }
             return repository.getDirectory().exists();
         } catch (IOException e) {
@@ -210,21 +296,17 @@ class GitRepository implements Repository {
         }
     }
 
-    /**
-     * Deletes the specified {@code directory} recursively.
-     */
-    private static void deltree(File directory) {
-        if (directory.exists()) {
+    void close() {
+        if (commitIdDatabase != null) {
+            commitIdDatabase.close();
+        }
+        if (jGitRepository != null) {
             try {
-                Files.walkFileTree(directory.toPath(), DeletingFileVisitor.INSTANCE);
-            } catch (IOException e) {
-                throw new IOError(e);
+                jGitRepository.close();
+            } catch (Exception e) {
+                logger.warn("Failed to close a Git repository: {}", jGitRepository.getDirectory(), e);
             }
         }
-    }
-
-    void close() {
-        jGitRepository.close();
     }
 
     @Override
@@ -237,47 +319,38 @@ class GitRepository implements Repository {
         return name;
     }
 
-    @Override
-    public CompletableFuture<Revision> normalize(Revision revision) {
-        // Don't bother caching runspace revisions; we do not use them at all.
-        if (!revision.onMainLane()) {
-            return CompletableFuture.supplyAsync(() -> blockingNormalize(revision), repositoryWorker);
-        }
-
-        final int maxMajor = headRevision.major();
-
-        int major = revision.major();
-
-        if (major >= 0) {
-            if (major > maxMajor) {
-                final CompletableFuture<Revision> future = new CompletableFuture<>();
-                future.completeExceptionally(new RevisionNotFoundException(revision));
-                return future;
-            }
-        } else {
-            major = maxMajor + major + 1;
-            if (major <= 0) {
-                final CompletableFuture<Revision> future = new CompletableFuture<>();
-                future.completeExceptionally(new RevisionNotFoundException(revision));
-                return future;
-            }
-        }
-
-        // Create a new instance only when necessary.
-        if (revision.major() == major) {
-            return CompletableFuture.completedFuture(revision);
-        } else {
-            return CompletableFuture.completedFuture(new Revision(major, 0));
-        }
+    public GitRepositoryFormat format() {
+        return format;
     }
 
-    private Revision blockingNormalize(Revision revision) {
+    public boolean needsMigration(GitRepositoryFormat preferredFormat) {
+        if (format != preferredFormat) {
+            return true;
+        }
+
+        if (!(jGitRepository.getRefDatabase() instanceof RefDirectory)) {
+            // 0.19.0 used RefTreeDatabase we do not use anymore.
+            return true;
+        }
+
+        final File oldTagFile = new File(
+                jGitRepository.getDirectory(),
+                "refs" + File.separatorChar + "tags" + File.separatorChar + "01" + File.separatorChar + "1.0");
+
+        // Some old repositories used tags to store the revision-to-commitId mappings,
+        // which has been replaced by CommitIdDatabase by https://github.com/line/centraldogma/pull/104
+        return oldTagFile.exists();
+    }
+
+    @Override
+    public Revision normalizeNow(Revision revision) {
+        return normalizeNow(revision, cachedHeadRevision().major());
+    }
+
+    private static Revision normalizeNow(Revision revision, int baseMajor) {
         requireNonNull(revision, "revision");
 
-        final int baseMajor = cachedMainLaneHeadRevision().major();
-
         int major = revision.major();
-        int minor = revision.minor();
 
         if (major >= 0) {
             if (major > baseMajor) {
@@ -290,26 +363,19 @@ class GitRepository implements Repository {
             }
         }
 
-        if (minor != 0) {
-            final int baseMinor = runspaceHeadRevision(major).minor();
-            if (minor > 0) {
-                if (minor > baseMinor) {
-                    throw new RevisionNotFoundException(revision);
-                }
-            } else {
-                minor = baseMinor + minor + 1;
-                if (minor <= 0) {
-                    throw new RevisionNotFoundException(revision);
-                }
-            }
-        }
-
         // Create a new instance only when necessary.
-        if (revision.major() == major && revision.minor() == minor) {
+        if (revision.major() == major) {
             return revision;
         } else {
-            return new Revision(major, minor);
+            return new Revision(major);
         }
+    }
+
+    @Override
+    public RevisionRange normalizeNow(Revision from, Revision to) {
+        final int baseMajor = cachedHeadRevision().major();
+
+        return new RevisionRange(normalizeNow(from, baseMajor), normalizeNow(to, baseMajor));
     }
 
     @Override
@@ -327,7 +393,7 @@ class GitRepository implements Repository {
         requireNonNull(revision, "revision");
         requireNonNull(options, "options");
 
-        final Revision normRevision = blockingNormalize(revision);
+        final Revision normRevision = normalizeNow(revision);
         final boolean fetchContent = FindOption.FETCH_CONTENT.get(options);
         final int maxEntries = FindOption.MAX_ENTRIES.get(options);
 
@@ -336,7 +402,7 @@ class GitRepository implements Repository {
              RevWalk revWalk = new RevWalk(reader)) {
 
             // Query on a non-exist revision will return empty result.
-            final Revision headRevision = cachedMainLaneHeadRevision();
+            final Revision headRevision = cachedHeadRevision();
             if (normRevision.compareTo(headRevision) > 0) {
                 return Collections.emptyMap();
             }
@@ -346,7 +412,7 @@ class GitRepository implements Repository {
             }
 
             final Map<String, Entry<?>> result = new LinkedHashMap<>();
-            final ObjectId commitId = toCommitId(normRevision);
+            final ObjectId commitId = commitIdDatabase.get(normRevision);
             final RevCommit revCommit = revWalk.parseCommit(commitId);
             final PathPatternFilter filter = PathPatternFilter.of(pathPattern);
 
@@ -382,7 +448,7 @@ class GitRepository implements Repository {
                         entry = Entry.ofJson(path, jsonNode);
                         break;
                     case TEXT:
-                        final String strVal = new String(content, StandardCharsets.UTF_8);
+                        final String strVal = sanitizeText(new String(content, UTF_8));
                         entry = Entry.ofText(path, strVal);
                         break;
                     default:
@@ -429,66 +495,13 @@ class GitRepository implements Repository {
             throw new IllegalArgumentException("maxCommits: " + maxCommits + " (expected: > 0)");
         }
 
-        final Revision origFrom = from;
-        final Revision origTo = to;
+        final RevisionRange range = normalizeNow(from, to);
+        final RevisionRange descendingRange = range.toDescending();
 
-        from = blockingNormalize(from);
-        to = blockingNormalize(to);
-
-        final boolean ascending = from.compareTo(to) < 0;
-        final ObjectId fromCommitId;
-        final ObjectId toCommitId;
-
-        if (ascending) {
-            // Swap 'from' and 'to'.
-            Revision temp = to;
-            to = from;
-            from = temp;
-        }
-
-        fromCommitId = toCommitId(from);
-        toCommitId = toCommitId(to);
+        final ObjectId fromCommitId = commitIdDatabase.get(descendingRange.from());
+        final ObjectId toCommitId = commitIdDatabase.get(descendingRange.to());
 
         // At this point, we are sure: from.major >= to.major
-        final boolean validCommitRange;
-        if (from.minor() != 0) {
-            if (to.minor() != 0) {
-                // Both revisions are runspace revisions, and thus must belong to the same runspace.
-                //
-                //     GOOD:         BAD:
-                //
-                //     |   from      | from
-                //     |   /         |/
-                //     |  to         *  to
-                //     | /           | /
-                //     |/            |/
-                //     *             *
-                //
-                validCommitRange = from.major() == to.major();
-            } else {
-                validCommitRange = true;
-            }
-        } else {
-            // If 'from' is a main lane revision, 'to' must also be a mainline revision
-            // because otherwise we will have to climb back up the runspace branch.
-            //
-            //   GOOD:     BAD:
-            //
-            //     |        |
-            //   from     from  /
-            //     |        |  to
-            //     |        | /
-            //     |        |/
-            //    to        *
-            //     |        |
-            //
-            validCommitRange = to.onMainLane();
-        }
-
-        if (!validCommitRange) {
-            throw new IllegalArgumentException("invalid commit range: " + origFrom + " .. " + origTo);
-        }
-
         try (RevWalk revWalk = new RevWalk(jGitRepository)) {
             // Walk through the commit tree to get the corresponding commit information by given filters
             revWalk.setTreeFilter(AndTreeFilter.create(TreeFilter.ANY_DIFF, PathPatternFilter.of(pathPattern)));
@@ -502,18 +515,18 @@ class GitRepository implements Repository {
                 revWalk.markUninteresting(toCommit);
             }
 
-            final List<Commit> revisionList = new ArrayList<>();
+            final List<Commit> commitList = new ArrayList<>();
             boolean needsLastCommit = true;
             for (RevCommit revCommit : revWalk) {
                 final Commit c = toCommit(revCommit);
                 if (c != null) {
-                    revisionList.add(c);
+                    commitList.add(c);
                 } else {
-                    // Probably garbage (e.g. deleted runspace)
+                    // Probably garbage?
                     continue;
                 }
 
-                if (revCommit.getId().equals(toCommitId) || revisionList.size() == maxCommits) {
+                if (revCommit.getId().equals(toCommitId) || commitList.size() == maxCommits) {
                     // Visited the last commit or can't retrieve beyond maxCommits
                     needsLastCommit = false;
                     break;
@@ -522,29 +535,31 @@ class GitRepository implements Repository {
 
             // Handle the case where the last commit was not visited by the RevWalk,
             // which can happen when the commit is empty.  In our repository, an empty commit can only be made
-            // when a new repository is created or a new runspace is created.
-            if (needsLastCommit) {
+            // when a new repository is created.
+            // If the pathPattern does not contain "/**", the caller wants commits only with the specific path,
+            // so skip the empty commit.
+            if (needsLastCommit && pathPattern.contains(ALL_PATH)) {
                 try (RevWalk tmpRevWalk = new RevWalk(jGitRepository)) {
                     final RevCommit lastRevCommit = tmpRevWalk.parseCommit(toCommitId);
                     final Revision lastCommitRevision =
                             CommitUtil.extractRevision(lastRevCommit.getFullMessage());
-                    if (lastCommitRevision.major() == 1 || lastCommitRevision.minor() == 1) {
-                        revisionList.add(toCommit(lastRevCommit));
+                    if (lastCommitRevision.major() == 1) {
+                        commitList.add(toCommit(lastRevCommit));
                     }
                 }
             }
 
-            if (ascending) {
-                Collections.reverse(revisionList);
+            if (!descendingRange.equals(range)) { // from and to is swapped so reverse the list.
+                Collections.reverse(commitList);
             }
 
-            return revisionList;
+            return commitList;
         } catch (StorageException e) {
             throw e;
         } catch (Exception e) {
             throw new StorageException(
                     "failed to retrieve the history: " + jGitRepository +
-                    " (" + pathPattern + ", " + origFrom + ".." + origTo + ')', e);
+                    " (" + pathPattern + ", " + from + ".." + to + ')', e);
         }
     }
 
@@ -584,7 +599,10 @@ class GitRepository implements Repository {
         requireNonNull(to, "to");
         requireNonNull(pathPattern, "pathPattern");
 
-        return toChangeMap(compareTrees(toCommitId(blockingNormalize(from)), toCommitId(blockingNormalize(to)),
+        final RevisionRange range = normalizeNow(from, to).toAscending();
+
+        return toChangeMap(compareTrees(commitIdDatabase.get(range.from()),
+                                        commitIdDatabase.get(range.to()),
                                         PathPatternFilter.of(pathPattern)));
     }
 
@@ -598,7 +616,7 @@ class GitRepository implements Repository {
     private Map<String, Change<?>> blockingPreviewDiff(Revision baseRevision, Iterable<Change<?>> changes) {
         requireNonNull(baseRevision, "baseRevision");
         requireNonNull(changes, "changes");
-        baseRevision = blockingNormalize(baseRevision);
+        baseRevision = normalizeNow(baseRevision);
 
         try (ObjectReader reader = jGitRepository.newObjectReader();
              RevWalk revWalk = new RevWalk(reader);
@@ -624,7 +642,7 @@ class GitRepository implements Repository {
     private Map<String, Change<?>> toChangeMap(List<DiffEntry> diffEntryList) {
 
         try (ObjectReader reader = jGitRepository.newObjectReader()) {
-            final Map<String, Change<?>> changeMap = new HashMap<>();
+            final Map<String, Change<?>> changeMap = new LinkedHashMap<>();
 
             for (DiffEntry diffEntry : diffEntryList) {
                 final String oldPath = '/' + diffEntry.getOldPath();
@@ -635,31 +653,36 @@ class GitRepository implements Repository {
                     final EntryType oldEntryType = EntryType.guessFromPath(oldPath);
                     switch (oldEntryType) {
                     case JSON:
-                        JsonNode oldJsonNode = Jackson.readTree(
-                                reader.open(diffEntry.getOldId().toObjectId()).getBytes());
-                        JsonNode newJsonNode = Jackson.readTree(
-                                reader.open(diffEntry.getNewId().toObjectId()).getBytes());
-
                         if (!oldPath.equals(newPath)) {
-                            changeMap.put(oldPath, Change.ofRename(oldPath, newPath));
+                            putChange(changeMap, oldPath, Change.ofRename(oldPath, newPath));
                         }
 
-                        changeMap.put(newPath, Change.ofJsonPatch(newPath, oldJsonNode, newJsonNode));
+                        final JsonNode oldJsonNode =
+                                Jackson.readTree(reader.open(diffEntry.getOldId().toObjectId()).getBytes());
+                        final JsonNode newJsonNode =
+                                Jackson.readTree(reader.open(diffEntry.getNewId().toObjectId()).getBytes());
+                        final JsonPatch patch =
+                                JsonPatch.generate(oldJsonNode, newJsonNode, ReplaceMode.SAFE);
+
+                        if (!patch.isEmpty()) {
+                            putChange(changeMap, newPath,
+                                      Change.ofJsonPatch(newPath, Jackson.valueToTree(patch)));
+                        }
                         break;
                     case TEXT:
-                        final String oldText = new String(
-                                reader.open(diffEntry.getOldId().toObjectId()).getBytes(),
-                                StandardCharsets.UTF_8);
+                        final String oldText = sanitizeText(new String(
+                                reader.open(diffEntry.getOldId().toObjectId()).getBytes(), UTF_8));
 
-                        final String newText = new String(
-                                reader.open(diffEntry.getNewId().toObjectId()).getBytes(),
-                                StandardCharsets.UTF_8);
+                        final String newText = sanitizeText(new String(
+                                reader.open(diffEntry.getNewId().toObjectId()).getBytes(), UTF_8));
 
                         if (!oldPath.equals(newPath)) {
-                            changeMap.put(oldPath, Change.ofRename(oldPath, newPath));
+                            putChange(changeMap, oldPath, Change.ofRename(oldPath, newPath));
                         }
 
-                        changeMap.put(newPath, Change.ofTextPatch(newPath, oldText, newText));
+                        if (!oldText.equals(newText)) {
+                            putChange(changeMap, newPath, Change.ofTextPatch(newPath, oldText, newText));
+                        }
                         break;
                     default:
                         throw new Error("unexpected old entry type: " + oldEntryType);
@@ -668,25 +691,26 @@ class GitRepository implements Repository {
                 case ADD:
                     final EntryType newEntryType = EntryType.guessFromPath(newPath);
                     switch (newEntryType) {
-                    case JSON:
+                    case JSON: {
                         final JsonNode jsonNode = Jackson.readTree(
                                 reader.open(diffEntry.getNewId().toObjectId()).getBytes());
 
-                        changeMap.put(newPath, Change.ofJsonUpsert(newPath, jsonNode));
+                        putChange(changeMap, newPath, Change.ofJsonUpsert(newPath, jsonNode));
                         break;
-                    case TEXT:
-                        final String text = new String(
-                                reader.open(diffEntry.getNewId().toObjectId()).getBytes(),
-                                StandardCharsets.UTF_8);
+                    }
+                    case TEXT: {
+                        final String text = sanitizeText(new String(
+                                reader.open(diffEntry.getNewId().toObjectId()).getBytes(), UTF_8));
 
-                        changeMap.put(newPath, Change.ofTextUpsert(newPath, text));
+                        putChange(changeMap, newPath, Change.ofTextUpsert(newPath, text));
                         break;
+                    }
                     default:
                         throw new Error("unexpected new entry type: " + newEntryType);
                     }
                     break;
                 case DELETE:
-                    changeMap.put(oldPath, Change.ofRemoval(oldPath));
+                    putChange(changeMap, oldPath, Change.ofRemoval(oldPath));
                     break;
                 default:
                     throw new Error();
@@ -698,52 +722,42 @@ class GitRepository implements Repository {
         }
     }
 
+    private static void putChange(Map<String, Change<?>> changeMap, String path, Change<?> change) {
+        final Change<?> oldChange = changeMap.put(path, change);
+        assert oldChange == null;
+    }
+
     @Override
     public CompletableFuture<Revision> commit(
-            Revision baseRevision, Author author, String summary,
+            Revision baseRevision, long commitTimeMillis, Author author, String summary,
             String detail, Markup markup, Iterable<Change<?>> changes) {
 
         return CompletableFuture.supplyAsync(
-                () -> blockingCommit(baseRevision, author, summary, detail, markup, changes), repositoryWorker);
+                () -> blockingCommit(baseRevision, commitTimeMillis,
+                                     author, summary, detail, markup, changes, false), repositoryWorker);
     }
 
     private Revision blockingCommit(
-            Revision baseRevision, Author author, String summary,
-            String detail, Markup markup, Iterable<Change<?>> changes) {
+            Revision baseRevision, long commitTimeMillis, Author author, String summary,
+            String detail, Markup markup, Iterable<Change<?>> changes, boolean allowEmptyCommit) {
 
         requireNonNull(baseRevision, "baseRevision");
 
         final CommitResult res;
         writeLock.lock();
         try {
-            final Revision normBaseRevision = blockingNormalize(baseRevision);
-            final Revision headRevision;
-            final Revision nextRevision;
-            final boolean pushToRunspace = normBaseRevision.minor() > 0;
-
-            if (pushToRunspace) {
-                headRevision = runspaceHeadRevision(baseRevision.major());
-                if (headRevision.minor() != normBaseRevision.minor()) {
-                    throw new ChangeConflictException(
-                            "invalid baseRevision: " + baseRevision + " (expected: " + headRevision +
-                            " or equivalent)");
-                }
-                nextRevision = new Revision(headRevision.major(), headRevision.minor() + 1);
-            } else {
-                headRevision = cachedMainLaneHeadRevision();
-                if (headRevision.major() != normBaseRevision.major()) {
-                    throw new ChangeConflictException(
-                            "invalid baseRevision: " + baseRevision + " (expected: " + headRevision +
-                            " or equivalent)");
-                }
-                nextRevision = new Revision(headRevision.major() + 1);
+            final Revision normBaseRevision = normalizeNow(baseRevision);
+            final Revision headRevision = cachedHeadRevision();
+            if (headRevision.major() != normBaseRevision.major()) {
+                throw new ChangeConflictException(
+                        "invalid baseRevision: " + baseRevision + " (expected: " + headRevision +
+                        " or equivalent)");
             }
 
-            res = commit0(headRevision, nextRevision, author, summary, detail, markup, changes, false);
+            res = commit0(headRevision, headRevision.forward(1), commitTimeMillis,
+                          author, summary, detail, markup, changes, allowEmptyCommit);
 
-            if (!pushToRunspace) {
-                this.headRevision = res.revision;
-            }
+            this.headRevision = res.revision;
         } finally {
             writeLock.unlock();
         }
@@ -753,7 +767,7 @@ class GitRepository implements Repository {
         return res.revision;
     }
 
-    private CommitResult commit0(Revision prevRevision, Revision nextRevision,
+    private CommitResult commit0(Revision prevRevision, Revision nextRevision, long commitTimeMillis,
                                  Author author, String summary, String detail, Markup markup,
                                  Iterable<Change<?>> changes, boolean allowEmpty) {
 
@@ -763,8 +777,8 @@ class GitRepository implements Repository {
         requireNonNull(detail, "detail");
         requireNonNull(markup, "markup");
 
-        assert prevRevision == null || prevRevision.major() > 0 && prevRevision.minor() >= 0;
-        assert nextRevision.major() > 0 && nextRevision.minor() >= 0;
+        assert prevRevision == null || prevRevision.major() > 0;
+        assert nextRevision.major() > 0;
 
         try (ObjectInserter inserter = jGitRepository.newObjectInserter();
              ObjectReader reader = jGitRepository.newObjectReader();
@@ -803,33 +817,29 @@ class GitRepository implements Repository {
 
             // build a commit object
             final PersonIdent personIdent = new PersonIdent(author.name(), author.email(),
-                                                            System.currentTimeMillis() / 1000L * 1000L, 0);
+                                                            commitTimeMillis / 1000L * 1000L, 0);
 
             final CommitBuilder commitBuilder = new CommitBuilder();
 
             commitBuilder.setAuthor(personIdent);
             commitBuilder.setCommitter(personIdent);
             commitBuilder.setTreeId(nextTreeId);
+            commitBuilder.setEncoding(UTF_8);
 
             // Write summary, detail and revision to commit's message as JSON format.
             commitBuilder.setMessage(CommitUtil.toJsonString(summary, detail, markup, nextRevision));
 
             // if the head commit exists, use it as the parent commit.
             if (prevRevision != null) {
-                commitBuilder.setParentId(toCommitId(prevRevision));
+                commitBuilder.setParentId(commitIdDatabase.get(prevRevision));
             }
 
             final ObjectId nextCommitId = inserter.insert(commitBuilder);
             inserter.flush();
 
             // tagging the revision object, for history lookup purpose.
-            doRefUpdate(revisionRef(nextRevision), nextCommitId);
-
-            if (nextRevision.onMainLane()) {
-                doRefUpdate(R_HEADS_MASTER, nextCommitId);
-            } else {
-                doRefUpdate(runspaceRef(nextRevision.major()), nextCommitId);
-            }
+            commitIdDatabase.put(nextRevision, nextCommitId);
+            doRefUpdate(revWalk, R_HEADS_MASTER, nextCommitId);
 
             return new CommitResult(nextRevision, prevTreeId, nextTreeId);
         } catch (IllegalArgumentException | StorageException e) {
@@ -864,31 +874,49 @@ class GitRepository implements Repository {
                                                            : null;
 
                 switch (change.type()) {
-                case UPSERT_JSON:
-                    applyPathEdit(dirCache, new PathEdit(changePath) {
-                        @Override
-                        public void apply(DirCacheEntry ent) {
-                            ent.setFileMode(FileMode.REGULAR_FILE);
-                            ent.setObjectId(newBlob(inserter, (JsonNode) change.content()));
-                        }
-                    });
-                    numEdits++;
+                case UPSERT_JSON: {
+                    final JsonNode oldJsonNode = oldContent != null ? Jackson.readTree(oldContent) : null;
+                    final JsonNode newJsonNode = (JsonNode) change.content();
+
+                    // Upsert only when the contents are really different.
+                    if (!newJsonNode.equals(oldJsonNode)) {
+                        applyPathEdit(dirCache, new PathEdit(changePath) {
+                            @Override
+                            public void apply(DirCacheEntry ent) {
+                                ent.setFileMode(FileMode.REGULAR_FILE);
+                                ent.setObjectId(newBlob(inserter, newJsonNode));
+                            }
+                        });
+                        numEdits++;
+                    }
                     break;
+                }
                 case UPSERT_TEXT: {
-                    applyPathEdit(dirCache, new PathEdit(changePath) {
-                        @Override
-                        public void apply(DirCacheEntry ent) {
-                            ent.setFileMode(FileMode.REGULAR_FILE);
-                            ent.setObjectId(newBlob(
-                                    inserter, ((String) change.content()).getBytes(StandardCharsets.UTF_8)));
-                        }
-                    });
-                    numEdits++;
+                    final String sanitizedOldText;
+                    if (oldContent != null) {
+                        sanitizedOldText = sanitizeText(new String(oldContent, UTF_8));
+                    } else {
+                        sanitizedOldText = null;
+                    }
+
+                    final String sanitizedNewText = sanitizeText(change.contentAsText());
+
+                    // Upsert only when the contents are really different.
+                    if (!sanitizedNewText.equals(sanitizedOldText)) {
+                        applyPathEdit(dirCache, new PathEdit(changePath) {
+                            @Override
+                            public void apply(DirCacheEntry ent) {
+                                ent.setFileMode(FileMode.REGULAR_FILE);
+                                ent.setObjectId(newBlob(inserter, sanitizedNewText.getBytes(UTF_8)));
+                            }
+                        });
+                        numEdits++;
+                    }
                     break;
                 }
                 case REMOVE:
                     if (oldEntry != null) {
-                        applyPathEdit(dirCache, new DirCacheEditor.DeletePath(changePath));
+                        applyPathEdit(dirCache, new DeletePath(changePath));
                         numEdits++;
                         break;
                     }
@@ -949,46 +977,64 @@ class GitRepository implements Repository {
                     final JsonNode newJsonNode;
                     try {
                         newJsonNode = JsonPatch.fromJson((JsonNode) change.content()).apply(oldJsonNode);
-                    } catch (JsonPatchException e) {
+                    } catch (Exception e) {
                         throw new ChangeConflictException("failed to apply JSON patch: " + change, e);
                     }
 
-                    applyPathEdit(dirCache, new PathEdit(changePath) {
-                        @Override
-                        public void apply(DirCacheEntry ent) {
-                            ent.setFileMode(FileMode.REGULAR_FILE);
-                            ent.setObjectId(newBlob(inserter, newJsonNode));
-                        }
-                    });
-                    numEdits++;
+                    // Apply only when the contents are really different.
+                    if (!newJsonNode.equals(oldJsonNode)) {
+                        applyPathEdit(dirCache, new PathEdit(changePath) {
+                            @Override
+                            public void apply(DirCacheEntry ent) {
+                                ent.setFileMode(FileMode.REGULAR_FILE);
+                                ent.setObjectId(newBlob(inserter, newJsonNode));
+                            }
+                        });
+                        numEdits++;
+                    }
                     break;
                 }
                 case APPLY_TEXT_PATCH:
-                    Patch<String> patch =
-                            DiffUtils.parseUnifiedDiff(Util.stringToLines((String) change.content()));
-                    final List<String> oldText;
+                    final Patch<String> patch = DiffUtils.parseUnifiedDiff(
+                            Util.stringToLines(sanitizeText((String) change.content())));
+
+                    final String sanitizedOldText;
+                    final List<String> sanitizedOldTextLines;
                     if (oldContent != null) {
-                        oldText = Util.stringToLines(new String(oldContent, StandardCharsets.UTF_8));
+                        sanitizedOldText = sanitizeText(new String(oldContent, UTF_8));
+                        sanitizedOldTextLines = Util.stringToLines(sanitizedOldText);
                     } else {
-                        oldText = Collections.emptyList();
+                        sanitizedOldText = null;
+                        sanitizedOldTextLines = Collections.emptyList();
                     }
 
-                    final List<String> newText;
+                    final String newText;
                     try {
-                        newText = DiffUtils.patch(oldText, patch);
-                    } catch (PatchFailedException e) {
+                        final List<String> newTextLines = DiffUtils.patch(sanitizedOldTextLines, patch);
+                        if (newTextLines.isEmpty()) {
+                            newText = "";
+                        } else {
+                            final StringJoiner joiner = new StringJoiner("\n", "", "\n");
+                            for (String line : newTextLines) {
+                                joiner.add(line);
+                            }
+                            newText = joiner.toString();
+                        }
+                    } catch (Exception e) {
                         throw new ChangeConflictException("failed to apply text patch: " + change, e);
                     }
 
-                    applyPathEdit(dirCache, new PathEdit(changePath) {
-                        @Override
-                        public void apply(DirCacheEntry ent) {
-                            ent.setFileMode(FileMode.REGULAR_FILE);
-                            ent.setObjectId(newBlob(
-                                    inserter, String.join("\n", newText).getBytes(StandardCharsets.UTF_8)));
-                        }
-                    });
-                    numEdits++;
+                    // Apply only when the contents are really different.
+                    if (!newText.equals(sanitizedOldText)) {
+                        applyPathEdit(dirCache, new PathEdit(changePath) {
+                            @Override
+                            public void apply(DirCacheEntry ent) {
+                                ent.setFileMode(FileMode.REGULAR_FILE);
+                                ent.setObjectId(newBlob(inserter, newText.getBytes(UTF_8)));
+                            }
+                        });
+                        numEdits++;
+                    }
                     break;
                 }
             }
@@ -998,6 +1044,19 @@ class GitRepository implements Repository {
             throw new StorageException("failed to apply changes on revision " + baseRevision, e);
         }
         return numEdits;
+    }
+
+    /**
+     * Removes {@code \r} and appends {@code \n} on the last line if it does not end with {@code \n}.
+     */
+    private static String sanitizeText(String text) {
+        if (text.indexOf('\r') >= 0) {
+            text = CR.matcher(text).replaceAll("");
+        }
+        if (!text.isEmpty() && !text.endsWith("\n")) {
+            text += "\n";
+        }
+        return text;
     }
 
     private static void reportNonExistentEntry(Change<?> change) {
@@ -1125,13 +1184,14 @@ class GitRepository implements Repository {
         }
     }
 
-    private void doRefUpdate(String ref, ObjectId commitId) throws IOException {
-        doRefUpdate(jGitRepository, ref, commitId);
+    private void doRefUpdate(RevWalk revWalk, String ref, ObjectId commitId) throws IOException {
+        doRefUpdate(jGitRepository, revWalk, ref, commitId);
     }
 
     @VisibleForTesting
-    static void doRefUpdate(org.eclipse.jgit.lib.Repository jGitRepository,
+    static void doRefUpdate(org.eclipse.jgit.lib.Repository jGitRepository, RevWalk revWalk,
                             String ref, ObjectId commitId) throws IOException {
+
         if (ref.startsWith(Constants.R_TAGS)) {
             final Ref oldRef = jGitRepository.exactRef(ref);
             if (oldRef != null) {
@@ -1142,7 +1202,7 @@ class GitRepository implements Repository {
         final RefUpdate refUpdate = jGitRepository.updateRef(ref);
         refUpdate.setNewObjectId(commitId);
 
-        final RefUpdate.Result res = refUpdate.update();
+        final Result res = refUpdate.update(revWalk);
         switch (res) {
             case NEW:
             case FAST_FORWARD:
@@ -1154,29 +1214,23 @@ class GitRepository implements Repository {
     }
 
     @Override
-    public CompletableFuture<Revision> watch(Revision lastKnownRev, String pathPattern) {
-        requireNonNull(lastKnownRev, "lastKnownRev");
+    public CompletableFuture<Revision> watch(Revision lastKnownRevision, String pathPattern) {
+        requireNonNull(lastKnownRevision, "lastKnownRevision");
         requireNonNull(pathPattern, "pathPattern");
         requireNonNull(repositoryWorker, "executor");
 
         final CompletableFuture<Revision> future = new CompletableFuture<>();
 
-        normalize(lastKnownRev).thenAccept(normalizedLastKnownRev -> {
-            final Revision headRev;
-            if (normalizedLastKnownRev.onMainLane()) {
-                headRev = cachedMainLaneHeadRevision();
-            } else {
-                headRev = runspaceHeadRevision(normalizedLastKnownRev.major());
-            }
-
+        normalize(lastKnownRevision).thenAccept(normLastKnownRevision -> {
+            final Revision headRevision = cachedHeadRevision();
             final PathPatternFilter filter = PathPatternFilter.of(pathPattern);
 
-            // If lastKnownRev is outdated already and the recent changes match, there's no need to watch.
-            if (!normalizedLastKnownRev.equals(headRev) &&
-                hasMatchingChanges(normalizedLastKnownRev, headRev, filter)) {
-                future.complete(headRev);
+            // If lastKnownRevision is outdated already and the recent changes match, there's no need to watch.
+            if (!normLastKnownRevision.equals(headRevision) &&
+                hasMatchingChanges(normLastKnownRevision, headRevision, filter)) {
+                future.complete(headRevision);
             } else {
-                commitWatchers.add(normalizedLastKnownRev, filter, future);
+                commitWatchers.add(normLastKnownRevision, filter, future);
             }
         }).exceptionally(cause -> {
             future.completeExceptionally(cause);
@@ -1230,126 +1284,14 @@ class GitRepository implements Repository {
         }
     }
 
-    /**
-     * Creates a new runspace at {@code majorRevision}.
-     *
-     * @param author author who creates this runspace
-     * @param majorRevision the major revision number based on which the runspace is created
-     * @return the {@link Revision} for newly created runspace
-     */
-    @Override
-    public CompletableFuture<Revision> createRunspace(Author author, int majorRevision) {
-        return CompletableFuture.supplyAsync(() -> blockingCreateRunspace(author, majorRevision),
-                                             repositoryWorker);
-    }
-
-    private Revision blockingCreateRunspace(Author author, int majorRevision) {
-        if (majorRevision <= 0) {
-            throw new IllegalArgumentException("majorRevision " + majorRevision + " (expected: > 0)");
-        }
-
-        final Revision prevRevision;
-        final Revision nextRevision;
-
-        writeLock.lock();
-        try {
-            if (resolveExactRef(runspaceRef(majorRevision)) != null) {
-                throw new StorageException("runspace exists already (majorRevision: " + majorRevision + ')');
-            }
-
-            prevRevision = new Revision(majorRevision);
-
-            if (resolveExactRef(revisionRef(prevRevision)) == null) {
-                throw new RevisionNotFoundException("non-existent majorRevision: " + majorRevision);
-            }
-
-            nextRevision = new Revision(majorRevision, 1);
-
-            return commit0(prevRevision, nextRevision, author, "Create a new runspace from " + majorRevision,
-                           "", Markup.PLAINTEXT, Collections.emptyList(), true).revision;
-        } finally {
-            writeLock.unlock();
-        }
-    }
-
-    /**
-     * Removes the runspace associated with the specified {@code majorRevision}.
-     */
-    @Override
-    public CompletableFuture<Void> removeRunspace(int majorRevision) {
-        return CompletableFuture.supplyAsync(() -> {
-            blockingRemoveRunspace(majorRevision);
-            return null;
-        }, repositoryWorker);
-    }
-
-    private void blockingRemoveRunspace(int majorRevision) {
-        writeLock.lock();
-        try {
-            final String oldRef = runspaceRef(majorRevision);
-            if (jGitRepository.exactRef(oldRef) == null) {
-                throw new StorageException("non-existent runspace for major revision: " + majorRevision);
-            }
-
-            final RefRename refRename =
-                    jGitRepository.renameRef(oldRef, removedRunspaceRef(majorRevision));
-            final Result result = refRename.rename();
-            if (Result.RENAMED != result) {
-                throw new StorageException(
-                        "failed to remove the runspace for major revision: " + majorRevision +
-                        " (result: " + result + ')');
-            }
-
-            final Map<String, Ref> refMap = jGitRepository.getRefDatabase().getRefs(
-                    Constants.R_TAGS + TagUtil.byteHexDirName(majorRevision));
-
-            for (Map.Entry<String, Ref> refEntry : refMap.entrySet()) {
-                final Revision revision = new Revision(refEntry.getKey());
-                if (revision.major() == majorRevision && !revision.onMainLane()) {
-                    RefUpdate refUpdate = jGitRepository.updateRef(refEntry.getValue().getName());
-                    refUpdate.setForceUpdate(true);
-                    refUpdate.delete();
-                }
-            }
-        } catch (StorageException e) {
-            throw e;
-        } catch (Exception e) {
-            throw new StorageException("failed to remove runspace for major revision: " + majorRevision, e);
-        } finally {
-            writeLock.unlock();
-        }
-    }
-
-    @Override
-    public CompletableFuture<Set<Revision>> listRunspaces() {
-        return CompletableFuture.supplyAsync(this::blockingListRunspaces, repositoryWorker);
-    }
-
-    private Set<Revision> blockingListRunspaces() {
-        final Set<Revision> runspaces = new HashSet<>();
-        try (RevWalk revWalk = new RevWalk(jGitRepository)) {
-            final Map<String, Ref> refMap = jGitRepository.getRefDatabase().getRefs(R_HEADS_RUNSPACES);
-            for (Ref ref : refMap.values()) {
-                RevCommit revCommit = revWalk.parseCommit(ref.getObjectId());
-                Revision revision = CommitUtil.extractRevision(revCommit.getFullMessage());
-                runspaces.add(revision);
-            }
-            return runspaces;
-        } catch (StorageException e) {
-            throw e;
-        } catch (Exception e) {
-            throw new StorageException("failed to list runspaces", e);
-        }
-    }
-
-    private Revision cachedMainLaneHeadRevision() {
+    private Revision cachedHeadRevision() {
         return headRevision;
     }
 
     /**
      * Returns the current revision.
      */
-    private Revision uncachedMainLaneHeadRevision() {
+    private Revision uncachedHeadRevision() {
         try (RevWalk revWalk = new RevWalk(jGitRepository)) {
             ObjectId headRevisionId = jGitRepository.resolve(R_HEADS_MASTER);
             if (headRevisionId != null) {
@@ -1363,26 +1305,6 @@ class GitRepository implements Repository {
         }
 
         throw new StorageException("failed to determine the HEAD: " + jGitRepository.getDirectory());
-    }
-
-    /**
-     * Get the latest revision for given runspace specified by {@code major}.
-     */
-    private Revision runspaceHeadRevision(int major) {
-        if (major == 0) {
-            throw new IllegalArgumentException("major: 0 (expected: a positive integer)");
-        }
-
-        try (RevWalk revWalk = new RevWalk(jGitRepository)) {
-            ObjectId commitId = toRunspaceHeadCommitId(major);
-            RevCommit revCommit = revWalk.parseCommit(commitId);
-            return CommitUtil.extractRevision(revCommit.getFullMessage());
-        } catch (StorageException e) {
-            throw e;
-        } catch (Exception e) {
-            throw new StorageException(
-                    "failed to get the latest runspace revision for major revision " + major, e);
-        }
     }
 
     /**
@@ -1400,7 +1322,7 @@ class GitRepository implements Repository {
     }
 
     private ObjectId toTreeId(RevWalk revWalk, Revision revision) {
-        final ObjectId commitId = toCommitId(revision);
+        final ObjectId commitId = commitIdDatabase.get(revision);
         try {
             return revWalk.parseCommit(commitId).getTree().getId();
         } catch (IOException e) {
@@ -1408,48 +1330,111 @@ class GitRepository implements Repository {
         }
     }
 
-    private ObjectId toCommitId(Revision revision) {
-        requireNonNull(revision, "revision");
-        final ObjectId resolved = resolveExactRef(revisionRef(revision));
-        if (resolved == null) {
-            throw new StorageException("failed to find the commit for the revision: " + revision);
-        }
-        return resolved;
+    /**
+     * Clones this repository into a new one.
+     */
+    public void cloneTo(File newRepoDir) {
+        cloneTo(newRepoDir, GitRepositoryFormat.V1);
     }
 
-    private ObjectId toRunspaceHeadCommitId(int major) {
-        final ObjectId resolved = resolveExactRef(runspaceRef(major));
-        if (resolved == null) {
-            throw new StorageException("failed to find the head commit for the runspace: " + major);
-        }
-        return resolved;
+    /**
+     * Clones this repository into a new one.
+     */
+    public void cloneTo(File newRepoDir, BiConsumer<Integer, Integer> progressListener) {
+        cloneTo(newRepoDir, GitRepositoryFormat.V1, progressListener);
     }
 
-    private ObjectId resolveExactRef(String ref) {
+    /**
+     * Clones this repository into a new one.
+     *
+     * @param format the repository format
+     */
+    public void cloneTo(File newRepoDir, GitRepositoryFormat format) {
+        cloneTo(newRepoDir, format, (current, total) -> { /* no-op */ });
+    }
+
+    /**
+     * Clones this repository into a new one.
+     *
+     * @param format the repository format
+     */
+    public void cloneTo(File newRepoDir, GitRepositoryFormat format,
+                        BiConsumer<Integer, Integer> progressListener) {
+
+        requireNonNull(newRepoDir, "newRepoDir");
+        requireNonNull(format, "format");
+        requireNonNull(progressListener, "progressListener");
+
+        final Revision endRevision = normalizeNow(Revision.HEAD);
+        final GitRepository newRepo = new GitRepository(parent, newRepoDir, format, repositoryWorker,
+                                                        creationTimeMillis(), author());
+
+        progressListener.accept(1, endRevision.major());
+        boolean success = false;
         try {
-            final Ref res = jGitRepository.exactRef(requireNonNull(ref, "ref"));
-            return res != null ? res.getObjectId() : null;
-        } catch (IOException e) {
-            throw new StorageException("failed to resolve: " + ref, e);
+            // Replay all commits.
+            Revision previousNonEmptyRevision = null;
+            for (int i = 2; i <= endRevision.major();) {
+                // Fetch up to 16 commits at once.
+                final int batch = 16;
+                final List<Commit> commits = blockingHistory(
+                        new Revision(i), new Revision(Math.min(endRevision.major(), i + batch - 1)),
+                        Repository.ALL_PATH, batch);
+                checkState(!commits.isEmpty(), "empty commits");
+
+                if (previousNonEmptyRevision == null) {
+                    previousNonEmptyRevision = commits.get(0).revision().backward(1);
+                }
+                for (Commit c : commits) {
+                    final Revision revision = c.revision();
+                    checkState(revision.major() == i,
+                               "mismatching revision: %s (expected: %s)", revision.major(), i);
+
+                    final Revision baseRevision = revision.backward(1);
+                    final Collection<Change<?>> changes =
+                            blockingDiff(previousNonEmptyRevision, revision, Repository.ALL_PATH).values();
+
+                    try {
+                        newRepo.blockingCommit(
+                                baseRevision, c.when(), c.author(), c.summary(), c.detail(), c.markup(),
+                                changes, /* allowEmptyCommit */ false);
+                        previousNonEmptyRevision = revision;
+                    } catch (RedundantChangeException e) {
+                        // NB: We allow an empty commit here because an old version of Central Dogma had a bug
+                        //     which allowed the creation of an empty commit.
+                        newRepo.blockingCommit(
+                                baseRevision, c.when(), c.author(), c.summary(), c.detail(), c.markup(),
+                                changes, /* allowEmptyCommit */ true);
+                    }
+
+                    progressListener.accept(i, endRevision.major());
+                    i++;
+                }
+            }
+
+            success = true;
+        } finally {
+            newRepo.close();
+            if (!success) {
+                deleteCruft(newRepoDir);
+            }
         }
     }
 
-    private static String revisionRef(Revision revision) {
-        return Constants.R_TAGS + TagUtil.byteHexDirName(revision.major()) +
-               (revision.minor() == 0 ? revision.text() + ".0" : revision.text());
-    }
-
-    private static String runspaceRef(int majorRevision) {
-        return R_HEADS_RUNSPACES + majorRevision;
-    }
-
-    private static String removedRunspaceRef(int majorRevision) {
-        return R_HEADS_RUNSPACES_REMOVED + majorRevision;
+    private static void deleteCruft(File repoDir) {
+        try {
+            Util.deleteFileTree(repoDir);
+        } catch (IOException e) {
+            logger.error("Failed to delete a half-created repository at: {}", repoDir, e);
+        }
     }
 
     @Override
     public String toString() {
-        return "GitRepository(" + jGitRepository.getDirectory() + ')';
+        return MoreObjects.toStringHelper(this)
+                          .add("dir", jGitRepository.getDirectory())
+                          .add("format", format)
+                          .toString();
     }
 
     private static final class CommitResult {
