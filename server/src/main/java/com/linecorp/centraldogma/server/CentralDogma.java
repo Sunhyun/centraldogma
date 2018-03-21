@@ -16,6 +16,8 @@
 
 package com.linecorp.centraldogma.server;
 
+import static com.google.common.base.Strings.isNullOrEmpty;
+import static com.linecorp.centraldogma.internal.api.v1.HttpApiV1Constants.API_V1_PATH_PREFIX;
 import static com.linecorp.centraldogma.server.internal.command.ProjectInitializer.initializeInternalProject;
 import static java.util.Objects.requireNonNull;
 
@@ -23,10 +25,12 @@ import java.io.File;
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
-import java.time.Duration;
+import java.nio.file.Files;
 import java.util.Collections;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.UUID;
 import java.util.concurrent.Executor;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.LinkedTransferQueue;
@@ -36,30 +40,22 @@ import java.util.function.Function;
 
 import javax.annotation.Nullable;
 
-import org.apache.shiro.cache.MemoryConstrainedCacheManager;
 import org.apache.shiro.config.Ini;
-import org.apache.shiro.config.IniSecurityManagerFactory;
-import org.apache.shiro.mgt.DefaultSecurityManager;
-import org.apache.shiro.mgt.SecurityManager;
-import org.apache.shiro.session.mgt.DefaultSessionManager;
-import org.apache.shiro.session.mgt.SessionManager;
-import org.apache.shiro.util.Factory;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import com.fasterxml.jackson.databind.module.SimpleModule;
 import com.github.benmanes.caffeine.cache.stats.CacheStats;
-import com.google.common.collect.ImmutableMap;
+import com.google.common.collect.ImmutableList;
 
-import com.linecorp.armeria.common.AggregatedHttpMessage;
 import com.linecorp.armeria.common.HttpHeaderNames;
 import com.linecorp.armeria.common.HttpHeaders;
 import com.linecorp.armeria.common.HttpRequest;
 import com.linecorp.armeria.common.HttpResponse;
-import com.linecorp.armeria.common.HttpResponseWriter;
 import com.linecorp.armeria.common.HttpStatus;
 import com.linecorp.armeria.common.MediaType;
 import com.linecorp.armeria.common.util.EventLoopGroups;
+import com.linecorp.armeria.common.util.Exceptions;
 import com.linecorp.armeria.server.AbstractHttpService;
 import com.linecorp.armeria.server.Server;
 import com.linecorp.armeria.server.ServerBuilder;
@@ -67,39 +63,53 @@ import com.linecorp.armeria.server.ServerListenerAdapter;
 import com.linecorp.armeria.server.ServerPort;
 import com.linecorp.armeria.server.Service;
 import com.linecorp.armeria.server.ServiceRequestContext;
-import com.linecorp.armeria.server.annotation.ResponseConverter;
 import com.linecorp.armeria.server.auth.HttpAuthService;
 import com.linecorp.armeria.server.docs.DocServiceBuilder;
+import com.linecorp.armeria.server.file.AbstractHttpVfs;
 import com.linecorp.armeria.server.file.HttpFileService;
-import com.linecorp.armeria.server.file.HttpVfs.ByteArrayEntry;
 import com.linecorp.armeria.server.healthcheck.HttpHealthCheckService;
+import com.linecorp.armeria.server.logging.AccessLogWriters;
 import com.linecorp.armeria.server.thrift.THttpService;
 import com.linecorp.armeria.server.thrift.ThriftCallService;
 import com.linecorp.centraldogma.internal.CsrfToken;
 import com.linecorp.centraldogma.internal.Jackson;
 import com.linecorp.centraldogma.internal.thrift.CentralDogmaService;
-import com.linecorp.centraldogma.server.internal.admin.authentication.ApplicationTokenAuthorizer;
-import com.linecorp.centraldogma.server.internal.admin.authentication.CentralDogmaSessionDAO;
+import com.linecorp.centraldogma.server.internal.admin.authentication.CentralDogmaSecurityManager;
 import com.linecorp.centraldogma.server.internal.admin.authentication.CsrfTokenAuthorizer;
 import com.linecorp.centraldogma.server.internal.admin.authentication.LoginService;
 import com.linecorp.centraldogma.server.internal.admin.authentication.LogoutService;
 import com.linecorp.centraldogma.server.internal.admin.authentication.SessionTokenAuthorizer;
-import com.linecorp.centraldogma.server.internal.admin.service.ProjectService;
 import com.linecorp.centraldogma.server.internal.admin.service.RepositoryService;
-import com.linecorp.centraldogma.server.internal.admin.service.TokenService;
 import com.linecorp.centraldogma.server.internal.admin.service.UserService;
 import com.linecorp.centraldogma.server.internal.admin.util.RestfulJsonResponseConverter;
+import com.linecorp.centraldogma.server.internal.api.AdministrativeService;
+import com.linecorp.centraldogma.server.internal.api.ContentServiceV1;
+import com.linecorp.centraldogma.server.internal.api.MetadataApiService;
+import com.linecorp.centraldogma.server.internal.api.ProjectServiceV1;
+import com.linecorp.centraldogma.server.internal.api.RepositoryServiceV1;
+import com.linecorp.centraldogma.server.internal.api.TokenService;
+import com.linecorp.centraldogma.server.internal.api.WatchService;
+import com.linecorp.centraldogma.server.internal.api.auth.ApplicationTokenAuthorizer;
+import com.linecorp.centraldogma.server.internal.api.converter.HttpApiRequestConverter;
+import com.linecorp.centraldogma.server.internal.api.converter.HttpApiResponseConverter;
 import com.linecorp.centraldogma.server.internal.command.CommandExecutor;
 import com.linecorp.centraldogma.server.internal.command.ProjectInitializingCommandExecutor;
 import com.linecorp.centraldogma.server.internal.command.StandaloneCommandExecutor;
+import com.linecorp.centraldogma.server.internal.metadata.MetadataService;
+import com.linecorp.centraldogma.server.internal.metadata.MetadataServiceInjector;
+import com.linecorp.centraldogma.server.internal.metadata.MigrationUtil;
 import com.linecorp.centraldogma.server.internal.mirror.DefaultMirroringService;
+import com.linecorp.centraldogma.server.internal.replication.ReplicationException;
 import com.linecorp.centraldogma.server.internal.replication.ZooKeeperCommandExecutor;
 import com.linecorp.centraldogma.server.internal.storage.project.DefaultProjectManager;
 import com.linecorp.centraldogma.server.internal.storage.project.ProjectManager;
+import com.linecorp.centraldogma.server.internal.storage.project.SafeProjectManager;
 import com.linecorp.centraldogma.server.internal.thrift.CentralDogmaExceptionTranslator;
 import com.linecorp.centraldogma.server.internal.thrift.CentralDogmaServiceImpl;
 import com.linecorp.centraldogma.server.internal.thrift.CentralDogmaTimeoutScheduler;
+import com.linecorp.centraldogma.server.internal.thrift.TokenlessClientLogger;
 
+import io.netty.handler.ssl.util.SelfSignedCertificate;
 import io.netty.util.concurrent.DefaultThreadFactory;
 
 /**
@@ -136,8 +146,6 @@ public class CentralDogma {
     private ExecutorService repositoryWorker;
     private CommandExecutor executor;
     private DefaultMirroringService mirroringService;
-    private CentralDogmaSessionManager sessionManager;
-    private SecurityManager securityManager;
 
     CentralDogma(CentralDogmaConfig cfg, @Nullable Ini securityConfig) {
         this.cfg = requireNonNull(cfg, "cfg");
@@ -210,8 +218,7 @@ public class CentralDogma {
         DefaultMirroringService mirroringService = null;
         CommandExecutor executor = null;
         Server server = null;
-        CentralDogmaSessionManager sessionManager = null;
-        SecurityManager securityManager = null;
+        CentralDogmaSecurityManager securityManager = null;
         try {
             logger.info("Starting the Central Dogma ..");
             repositoryWorker = new ThreadPoolExecutor(
@@ -234,20 +241,18 @@ public class CentralDogma {
                                                            cfg.maxNumBytesPerMirror());
 
             if (cfg.isSecurityEnabled()) {
-                sessionManager = new CentralDogmaSessionManager();
-                securityManager = createSecurityManager(securityConfig, sessionManager);
+                securityManager = new CentralDogmaSecurityManager(cfg.dataDir(), securityConfig,
+                                                                  cfg.webAppSessionTimeoutMillis());
             }
 
             logger.info("Starting the command executor ..");
-            executor = startCommandExecutor(pm, mirroringService, repositoryWorker, sessionManager);
+            executor = startCommandExecutor(pm, mirroringService, repositoryWorker, securityManager);
             logger.info("Started the command executor");
 
             initializeInternalProject(executor);
 
-            if (cfg.isSecurityEnabled()) {
-                sessionManager.setSessionDAO(new CentralDogmaSessionDAO(pm, executor));
-                sessionManager.setSessionValidationInterval(Duration.ofMinutes(10).toMillis());
-            }
+            // Migrate tokens and create metadata files if it does not exist.
+            MigrationUtil.migrate(pm, executor);
 
             logger.info("Starting the RPC server");
             server = startServer(pm, executor, securityManager);
@@ -261,8 +266,6 @@ public class CentralDogma {
                 this.executor = executor;
                 this.mirroringService = mirroringService;
                 this.server = server;
-                this.sessionManager = sessionManager;
-                this.securityManager = securityManager;
             } else {
                 stop(server, executor, mirroringService, pm, repositoryWorker);
             }
@@ -270,17 +273,18 @@ public class CentralDogma {
     }
 
     private CommandExecutor startCommandExecutor(
-            ProjectManager pm, DefaultMirroringService mirroringService, Executor repositoryWorker,
-            CentralDogmaSessionManager sessionManager) {
+            ProjectManager pm, DefaultMirroringService mirroringService,
+            Executor repositoryWorker, @Nullable CentralDogmaSecurityManager securityManager) {
+
         final CommandExecutor executor;
         final ReplicationMethod replicationMethod = cfg.replicationConfig().method();
         switch (replicationMethod) {
             case ZOOKEEPER:
-                executor = newZooKeeperCommandExecutor(pm, repositoryWorker);
+                executor = newZooKeeperCommandExecutor(pm, repositoryWorker, securityManager);
                 break;
             case NONE:
                 logger.info("No replication mechanism specified; entering standalone");
-                executor = new StandaloneCommandExecutor(pm, repositoryWorker);
+                executor = new StandaloneCommandExecutor(pm, securityManager, repositoryWorker);
                 break;
             default:
                 throw new Error("unknown replication method: " + replicationMethod);
@@ -288,34 +292,33 @@ public class CentralDogma {
 
         final CommandExecutor projInitExecutor = new ProjectInitializingCommandExecutor(executor);
         try {
-            if (cfg.isMirroringEnabled()) {
-                projInitExecutor.start(() -> {
+            projInitExecutor.start(() -> {
+                if (cfg.isMirroringEnabled()) {
                     logger.info("Starting the mirroring service ..");
                     mirroringService.start(projInitExecutor);
                     logger.info("Started the mirroring service");
-                    if (sessionManager != null) {
-                        sessionManager.onTakeLeadership();
-                    }
-                }, () -> {
+                } else {
+                    logger.info("Not starting the mirroring service because it's disabled.");
+                }
+
+                if (securityManager != null) {
+                    logger.info("Starting the periodic session validation ..");
+                    securityManager.enableSessionValidation();
+                    logger.info("Started the periodic session validation");
+                }
+            }, () -> {
+                if (cfg.isMirroringEnabled()) {
                     logger.info("Stopping the mirroring service ..");
                     mirroringService.stop();
                     logger.info("Stopped the mirroring service");
-                    if (sessionManager != null) {
-                        sessionManager.onReleaseLeadership();
-                    }
-                });
-            } else {
-                projInitExecutor.start(() -> {
-                    logger.info("Not starting the mirroring service because it's disabled.");
-                    if (sessionManager != null) {
-                        sessionManager.onTakeLeadership();
-                    }
-                }, () -> {
-                    if (sessionManager != null) {
-                        sessionManager.onReleaseLeadership();
-                    }
-                });
-            }
+                }
+
+                if (securityManager != null) {
+                    logger.info("Stopping the periodic session validation ..");
+                    securityManager.disableSessionValidation();
+                    logger.info("Stopped the periodic session validation");
+                }
+            });
         } catch (Exception e) {
             logger.warn("Failed to start the command executor. Entering read-only.", e);
         }
@@ -323,10 +326,33 @@ public class CentralDogma {
         return projInitExecutor;
     }
 
-    private Server startServer(ProjectManager pm, CommandExecutor executor, SecurityManager securityManager) {
+    private Server startServer(ProjectManager pm, CommandExecutor executor,
+                               @Nullable CentralDogmaSecurityManager securityManager) {
         final ServerBuilder sb = new ServerBuilder();
-        for (ServerPort p: cfg.ports()) {
+
+        boolean requiresTls = false;
+        for (final ServerPort p : cfg.ports()) {
             sb.port(p);
+            if (p.protocol().isTls()) {
+                requiresTls = true;
+            }
+        }
+        if (requiresTls) {
+            try {
+                final TlsConfig tlsConfig = cfg.tls();
+                if (tlsConfig != null) {
+                    sb.tls(tlsConfig.keyCertChainFile(), tlsConfig.keyFile(), tlsConfig.keyPassword());
+                } else {
+                    // TODO(hyangtack) Replace sb.tls() with sb.tlsSelfSigned() later.
+                    // https://github.com/line/armeria/pull/1085
+                    logger.warn(
+                            "Missing TLS configuration. Generating a self-signed certificate for TLS support.");
+                    final SelfSignedCertificate ssc = new SelfSignedCertificate();
+                    sb.tls(ssc.certificate(), ssc.privateKey());
+                }
+            } catch (Exception e) {
+                Exceptions.throwUnsafely(e);
+            }
         }
 
         cfg.numWorkers().ifPresent(
@@ -338,38 +364,37 @@ public class CentralDogma {
         cfg.gracefulShutdownTimeout().ifPresent(
                 t -> sb.gracefulShutdownTimeout(t.quietPeriodMillis(), t.timeoutMillis()));
 
-        final CentralDogmaServiceImpl service =
-                new CentralDogmaServiceImpl(pm, executor);
-
-        sb.service("/cd/thrift/v1",
-                     ThriftCallService.of(service)
-                                      .decorate(CentralDogmaTimeoutScheduler::new)
-                                      .decorate(CentralDogmaExceptionTranslator::new)
-                                      .decorate(THttpService.newDecorator())
-                                      .decorate(HttpAuthService.newDecorator(new CsrfTokenAuthorizer())));
-
-        sb.service("/hostname", HttpFileService.forVfs(
-                (path, encoding) -> new ByteArrayEntry(
-                        path, MediaType.PLAIN_TEXT_UTF_8,
-                        server.defaultHostname().getBytes(StandardCharsets.UTF_8))));
-
-        sb.service("/cache_stats", new AbstractHttpService() {
+        final WatchService watchService = new WatchService();
+        sb.serverListener(new ServerListenerAdapter() {
             @Override
-            protected void doGet(ServiceRequestContext ctx, HttpRequest req, HttpResponseWriter res)
-                    throws Exception {
-                res.respond(HttpStatus.OK,
-                            MediaType.JSON_UTF_8,
-                            Jackson.writeValueAsPrettyString(pm.cacheStats()));
+            public void serverStopping(Server server) {
+                watchService.serverStopping();
             }
         });
 
-        sb.service("/security_enabled", new AbstractHttpService() {
+        configureThriftService(sb, pm, executor, watchService);
+
+        sb.service("/hostname", HttpFileService.forVfs(new AbstractHttpVfs() {
             @Override
-            protected void doGet(ServiceRequestContext ctx, HttpRequest req, HttpResponseWriter res)
+            public Entry get(String path, @Nullable String contentEncoding) {
+                requireNonNull(path, "path");
+                return new ByteArrayEntry(path, MediaType.PLAIN_TEXT_UTF_8,
+                                          server.defaultHostname().getBytes(StandardCharsets.UTF_8));
+            }
+
+            @Override
+            public String meterTag() {
+                return "hostname";
+            }
+        }));
+
+        sb.service("/cache_stats", new AbstractHttpService() {
+            @Override
+            protected HttpResponse doGet(ServiceRequestContext ctx, HttpRequest req)
                     throws Exception {
-                res.respond(HttpStatus.OK,
-                            MediaType.JSON_UTF_8,
-                            Jackson.writeValueAsPrettyString(cfg.isSecurityEnabled()));
+                return HttpResponse.of(HttpStatus.OK,
+                                       MediaType.JSON_UTF_8,
+                                       Jackson.writeValueAsPrettyString(pm.cacheStats()));
             }
         });
 
@@ -379,11 +404,10 @@ public class CentralDogma {
         //                  It would be removed if this kind of redirection is handled by Armeria.
         sb.service("/docs", new AbstractHttpService() {
             @Override
-            protected void doGet(ServiceRequestContext ctx, HttpRequest req, HttpResponseWriter res)
+            protected HttpResponse doGet(ServiceRequestContext ctx, HttpRequest req)
                     throws Exception {
-                res.respond(AggregatedHttpMessage.of(
-                        HttpHeaders.of(HttpStatus.TEMPORARY_REDIRECT)
-                                   .set(HttpHeaderNames.LOCATION, "/docs/")));
+                return HttpResponse.of(HttpHeaders.of(HttpStatus.TEMPORARY_REDIRECT)
+                                                  .set(HttpHeaderNames.LOCATION, "/docs/"));
             }
         });
         sb.serviceUnder("/docs/",
@@ -393,35 +417,72 @@ public class CentralDogma {
                                                "bearer " + CsrfToken.ANONYMOUS))
                                                .build());
 
-        if (cfg.isWebAppEnabled()) {
-            configureWebAdmin(sb, pm, executor, securityManager);
-        }
+        configureHttpApi(sb, pm, executor, watchService, securityManager);
 
-        sb.serverListener(new ServerListenerAdapter() {
-            @Override
-            public void serverStopping(Server server) {
-                service.serverStopping();
-            }
-        });
+        final String accessLogFormat = cfg.accessLogFormat();
+        if (isNullOrEmpty(accessLogFormat)) {
+            sb.accessLogWriter(AccessLogWriters.disabled());
+        } else if ("common".equals(accessLogFormat)) {
+            sb.accessLogWriter(AccessLogWriters.common());
+        } else if ("combined".equals(accessLogFormat)) {
+            sb.accessLogWriter(AccessLogWriters.combined());
+        } else {
+            sb.accessLogFormat(accessLogFormat);
+        }
 
         final Server s = sb.build();
         s.start().join();
         return s;
     }
 
-    private CommandExecutor newZooKeeperCommandExecutor(ProjectManager pm, Executor repositoryWorker) {
+    private CommandExecutor newZooKeeperCommandExecutor(ProjectManager pm, Executor repositoryWorker,
+                                                        @Nullable CentralDogmaSecurityManager securityManager) {
 
         final ZooKeeperReplicationConfig zkCfg = (ZooKeeperReplicationConfig) cfg.replicationConfig();
-        final String replicaId = zkCfg.replicaId();
-        logger.info("Using ZooKeeper-based replication mechanism; replicaId = {}", replicaId);
+
+        // Read or generate the replica ID.
+        final File replicaIdFile =
+                new File(cfg.dataDir().getAbsolutePath() + File.separatorChar + "replica_id");
+        final String replicaId;
+
+        if (replicaIdFile.exists()) {
+            // Read the replica ID.
+            try {
+                final List<String> lines = Files.readAllLines(replicaIdFile.toPath());
+                if (lines.isEmpty()) {
+                    throw new IllegalStateException("replica_id contains no lines.");
+                }
+                replicaId = lines.get(0).trim();
+                if (replicaId.isEmpty()) {
+                    throw new IllegalStateException("replica_id is empty.");
+                }
+            } catch (Exception e) {
+                throw new ReplicationException("failed to retrieve the replica ID from: " + replicaIdFile, e);
+            }
+            logger.info("Using ZooKeeper-based replication mechanism with an existing replica ID: {}",
+                        replicaId);
+        } else {
+            // Generate a replica ID.
+            replicaId = UUID.randomUUID().toString();
+            try {
+                Files.write(replicaIdFile.toPath(), ImmutableList.of(replicaId));
+            } catch (Exception e) {
+                throw new ReplicationException("failed to generate a replica ID into: " + replicaIdFile, e);
+            }
+            logger.info("Using ZooKeeper-based replication mechanism with a generated replica ID: {}",
+                        replicaId);
+        }
 
         // TODO(trustin): Provide a way to restart/reload the replicator
         //                so that we can recover from ZooKeeper maintenance automatically.
         final File revisionFile =
                 new File(cfg.dataDir().getAbsolutePath() + File.separatorChar + "last_revision");
+
         return ZooKeeperCommandExecutor.builder()
                                        .replicaId(replicaId)
-                                       .delegate(new StandaloneCommandExecutor(replicaId, pm, repositoryWorker))
+                                       .delegate(new StandaloneCommandExecutor(replicaId, pm,
+                                                                               securityManager,
+                                                                               repositoryWorker))
                                        .numWorkers(zkCfg.numWorkers())
                                        .connectionString(zkCfg.connectionString())
                                        .timeoutMillis(zkCfg.timeoutMillis())
@@ -433,51 +494,98 @@ public class CentralDogma {
                                        .build();
     }
 
-    private void configureWebAdmin(ServerBuilder sb,
-                                   ProjectManager pm, CommandExecutor executor,
-                                   SecurityManager securityManager) {
-        final String apiPathPrefix = "/api/v0/";
+    private void configureThriftService(ServerBuilder sb, ProjectManager pm, CommandExecutor executor,
+                                        WatchService watchService) {
+        final CentralDogmaServiceImpl service =
+                new CentralDogmaServiceImpl(pm, executor, watchService);
 
-        final TokenService tokenService = new TokenService(pm, executor);
+        Service<HttpRequest, HttpResponse> thriftService =
+                ThriftCallService.of(service)
+                                 .decorate(CentralDogmaTimeoutScheduler::new)
+                                 .decorate(CentralDogmaExceptionTranslator::new)
+                                 .decorate(THttpService.newDecorator());
 
-        final Function<Service<HttpRequest, HttpResponse>,
-                        ? extends Service<HttpRequest, HttpResponse>> decorator;
-        if (cfg.isSecurityEnabled()) {
-            requireNonNull(securityManager, "securityManager");
-            sb.service(apiPathPrefix + "authenticate", new LoginService(securityManager))
-              .service(apiPathPrefix + "logout", new LogoutService(securityManager));
-
-            final ApplicationTokenAuthorizer ata = new ApplicationTokenAuthorizer(tokenService::findToken);
-            final SessionTokenAuthorizer sta = new SessionTokenAuthorizer(securityManager);
-
-            decorator = HttpAuthService.newDecorator(ata, sta);
+        if (cfg.isCsrfTokenRequiredForThrift()) {
+            thriftService = thriftService.decorate(HttpAuthService.newDecorator(new CsrfTokenAuthorizer()));
         } else {
-            decorator = HttpAuthService.newDecorator(new CsrfTokenAuthorizer());
+            thriftService = thriftService.decorate(TokenlessClientLogger::new);
         }
 
-        final Map<Class<?>, ResponseConverter> converters = ImmutableMap.of(
-                Object.class, new RestfulJsonResponseConverter()  // Default converter
-        );
-
-        // TODO(hyangtack): Simplify this if https://github.com/line/armeria/issues/582 is resolved.
-        sb.annotatedService(apiPathPrefix, new UserService(pm, executor), converters, decorator)
-          .annotatedService(apiPathPrefix, new ProjectService(pm, executor), converters, decorator)
-          .annotatedService(apiPathPrefix, new RepositoryService(pm, executor), converters, decorator)
-          .annotatedService(apiPathPrefix, tokenService, converters, decorator)
-          .serviceUnder("/", HttpFileService.forClassPath("webapp"));
+        sb.service("/cd/thrift/v1", thriftService);
     }
 
-    private static SecurityManager createSecurityManager(Ini securityConfig, SessionManager sessionManager) {
-        final Factory<SecurityManager> factory = new IniSecurityManagerFactory(securityConfig) {
-            @Override
-            protected SecurityManager createDefaultInstance() {
-                DefaultSecurityManager securityManager = new DefaultSecurityManager();
-                securityManager.setSessionManager(sessionManager);
-                securityManager.setCacheManager(new MemoryConstrainedCacheManager());
-                return securityManager;
-            }
-        };
-        return factory.getInstance();
+    private void configureHttpApi(ServerBuilder sb,
+                                  ProjectManager pm, CommandExecutor executor, WatchService watchService,
+                                  @Nullable CentralDogmaSecurityManager securityManager) {
+        // TODO(hyangtack) Replace the prefix with something like "/api/web/" or "/api/admin/".
+        final String apiV0PathPrefix = "/api/v0/";
+
+        final MetadataService mds = new MetadataService(pm, executor);
+
+        final Function<Service<HttpRequest, HttpResponse>,
+                ? extends Service<HttpRequest, HttpResponse>> decorator;
+        if (cfg.isSecurityEnabled()) {
+            requireNonNull(securityManager, "securityManager");
+            sb.service(apiV0PathPrefix + "authenticate", new LoginService(securityManager, executor))
+              .service(apiV0PathPrefix + "logout", new LogoutService(securityManager, executor));
+
+            sb.service("/security_enabled", new AbstractHttpService() {
+                @Override
+                protected HttpResponse doGet(ServiceRequestContext ctx, HttpRequest req) {
+                    return HttpResponse.of(HttpStatus.OK);
+                }
+            });
+
+            final ApplicationTokenAuthorizer ata =
+                    new ApplicationTokenAuthorizer(mds::findTokenBySecret);
+            final SessionTokenAuthorizer sta = new SessionTokenAuthorizer(securityManager,
+                                                                          cfg.administrators());
+
+            decorator = MetadataServiceInjector.newDecorator(mds)
+                                               .andThen(HttpAuthService.newDecorator(ata, sta));
+        } else {
+            decorator = MetadataServiceInjector.newDecorator(mds)
+                                               .andThen(HttpAuthService.newDecorator(
+                                                       new CsrfTokenAuthorizer()));
+        }
+
+        final SafeProjectManager safePm = new SafeProjectManager(pm);
+
+        final HttpApiRequestConverter v1RequestConverter = new HttpApiRequestConverter(safePm);
+        final HttpApiResponseConverter v1ResponseConverter = new HttpApiResponseConverter();
+
+        sb.annotatedService(API_V1_PATH_PREFIX,
+                            new AdministrativeService(safePm, executor), decorator,
+                            v1RequestConverter, v1ResponseConverter);
+        sb.annotatedService(API_V1_PATH_PREFIX,
+                            new ProjectServiceV1(safePm, executor, mds), decorator,
+                            v1RequestConverter, v1ResponseConverter);
+        sb.annotatedService(API_V1_PATH_PREFIX,
+                            new RepositoryServiceV1(safePm, executor, mds), decorator,
+                            v1RequestConverter, v1ResponseConverter);
+        sb.annotatedService(API_V1_PATH_PREFIX,
+                            new ContentServiceV1(safePm, executor, watchService), decorator,
+                            v1RequestConverter, v1ResponseConverter);
+
+        if (cfg.isSecurityEnabled()) {
+            sb.annotatedService(API_V1_PATH_PREFIX,
+                                new MetadataApiService(mds), decorator,
+                                v1RequestConverter, v1ResponseConverter);
+            sb.annotatedService(API_V1_PATH_PREFIX, new TokenService(pm, executor, mds),
+                                decorator, v1RequestConverter, v1ResponseConverter);
+        }
+
+        if (cfg.isWebAppEnabled()) {
+            final RestfulJsonResponseConverter httpApiV0Converter = new RestfulJsonResponseConverter();
+
+            // TODO(hyangtack): Simplify this if https://github.com/line/armeria/issues/582 is resolved.
+            sb.annotatedService(apiV0PathPrefix, new UserService(safePm, executor),
+                                decorator, httpApiV0Converter)
+              .annotatedService(apiV0PathPrefix, new RepositoryService(safePm, executor),
+                                decorator, httpApiV0Converter);
+        }
+
+        sb.serviceUnder("/", HttpFileService.forClassPath("webapp"));
     }
 
     /**
@@ -499,8 +607,6 @@ public class CentralDogma {
         this.mirroringService = null;
         this.pm = null;
         this.repositoryWorker = null;
-        this.sessionManager = null;
-        this.securityManager = null;
 
         logger.info("Stopping the Central Dogma ..");
         if (!stop(server, executor, mirroringService, pm, repositoryWorker)) {
@@ -579,27 +685,5 @@ public class CentralDogma {
             }
         }
         return success;
-    }
-
-    /**
-     * A {@link SessionManager} which makes it possible to call
-     * {@link DefaultSessionManager#enableSessionValidation()} and
-     * {@link DefaultSessionManager#disableSessionValidation()} according to this server's leadership.
-     */
-    static final class CentralDogmaSessionManager extends DefaultSessionManager {
-
-        void onTakeLeadership() {
-            logger.info("Starting the session service ..");
-            setSessionValidationSchedulerEnabled(true);
-            enableSessionValidation();
-            logger.info("Started the session service");
-        }
-
-        void onReleaseLeadership() {
-            logger.info("Stopping the session service ..");
-            setSessionValidationSchedulerEnabled(false);
-            disableSessionValidation();
-            logger.info("Stopped the session service");
-        }
     }
 }

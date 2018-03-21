@@ -25,12 +25,13 @@ import static java.util.Objects.requireNonNull;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 
 import javax.annotation.Nullable;
 
 import com.fasterxml.jackson.databind.JsonNode;
+import com.google.common.base.Throwables;
 import com.google.common.collect.ImmutableMap;
 import com.spotify.futures.CompletableFutures;
 
@@ -44,6 +45,7 @@ import com.linecorp.centraldogma.common.Query;
 import com.linecorp.centraldogma.common.QueryException;
 import com.linecorp.centraldogma.common.QueryResult;
 import com.linecorp.centraldogma.common.Revision;
+import com.linecorp.centraldogma.common.RevisionRange;
 import com.linecorp.centraldogma.server.internal.storage.StorageException;
 import com.linecorp.centraldogma.server.internal.storage.project.Project;
 
@@ -51,6 +53,8 @@ import com.linecorp.centraldogma.server.internal.storage.project.Project;
  * Revision-controlled filesystem-like repository.
  */
 public interface Repository {
+
+    int DEFAULT_MAX_COMMITS = 1024;
 
     String ALL_PATH = "/**";
 
@@ -65,9 +69,62 @@ public interface Repository {
     String name();
 
     /**
-     * Validates the specified {@link Revision} and converts it into an absolute {@link Revision}.
+     * Returns the creation time of this {@link Repository}.
      */
-    CompletableFuture<Revision> normalize(Revision revision);
+    default long creationTimeMillis() {
+        try {
+            final List<Commit> history = history(Revision.INIT, Revision.INIT, ALL_PATH, 1).join();
+            return history.get(0).when();
+        } catch (CompletionException e) {
+            final Throwable cause = Throwables.getRootCause(e);
+            Throwables.throwIfUnchecked(cause);
+            throw new StorageException("failed to retrieve the initial commit", cause);
+        }
+    }
+
+    /**
+     * Returns the author who created this {@link Repository}.
+     */
+    default Author author() {
+        try {
+            final List<Commit> history = history(Revision.INIT, Revision.INIT, ALL_PATH, 1).join();
+            return history.get(0).author();
+        } catch (CompletionException e) {
+            final Throwable cause = Throwables.getRootCause(e);
+            Throwables.throwIfUnchecked(cause);
+            throw new StorageException("failed to retrieve the initial commit", cause);
+        }
+    }
+
+    /**
+     * Returns the {@link CompletableFuture} whose value is the absolute {@link Revision} of the
+     * specified {@link Revision}.
+     *
+     * @deprecated Use {@link #normalizeNow(Revision)} instead.
+     */
+    @Deprecated
+    default CompletableFuture<Revision> normalize(Revision revision) {
+        try {
+            return CompletableFuture.completedFuture(normalizeNow(revision));
+        } catch (Exception e) {
+            return CompletableFutures.exceptionallyCompletedFuture(e);
+        }
+    }
+
+    /**
+     * Returns the absolute {@link Revision} of the specified {@link Revision}.
+     *
+     * @throws RevisionNotFoundException if the specified {@link Revision} is not found
+     */
+    Revision normalizeNow(Revision revision);
+
+    /**
+     * Returns a {@link RevisionRange} which contains the absolute {@link Revision}s of the specified
+     * {@code from} and {@code to}.
+     *
+     * @throws RevisionNotFoundException if the specified {@code from} or {@code to} is not found
+     */
+    RevisionRange normalizeNow(Revision from, Revision to);
 
     /**
      * Returns {@code true} if and only if an {@link Entry} exists at the specified {@code path}.
@@ -112,7 +169,7 @@ public interface Repository {
     }
 
     /**
-     * Retrieves an {@link Entry} at the specified {@code path}. {@code other} is returned
+     * Retrieves an {@link Entry} at the specified {@code path}.
      *
      * @return the {@link Entry} at the specified {@code path} if exists.
      *         The specified {@code other} if there's no such {@link Entry}.
@@ -190,9 +247,11 @@ public interface Repository {
         requireNonNull(to, "to");
         requireNonNull(query, "query");
 
+        final RevisionRange range = normalizeNow(from, to).toAscending();
+
         final String path = query.path();
-        final CompletableFuture<Entry<?>> fromEntryFuture = getOrElse(from, path, null);
-        final CompletableFuture<Entry<?>> toEntryFuture = getOrElse(to, path, null);
+        final CompletableFuture<Entry<?>> fromEntryFuture = getOrElse(range.from(), path, null);
+        final CompletableFuture<Entry<?>> toEntryFuture = getOrElse(range.to(), path, null);
 
         final CompletableFuture<Change<?>> future =
                 CompletableFutures.combine(fromEntryFuture, toEntryFuture, (fromEntry, toEntry) -> {
@@ -270,9 +329,9 @@ public interface Repository {
      *
      * @return the {@link Revision} of the new {@link Commit}
      */
-    default CompletableFuture<Revision> commit(
-            Revision baseRevision, Author author, String summary, Iterable<Change<?>> changes) {
-        return commit(baseRevision, author, summary, "", Markup.PLAINTEXT, changes);
+    default CompletableFuture<Revision> commit(Revision baseRevision, long commitTimeMillis,
+                                               Author author, String summary, Iterable<Change<?>> changes) {
+        return commit(baseRevision, commitTimeMillis, author, summary, "", Markup.PLAINTEXT, changes);
     }
 
     /**
@@ -280,9 +339,9 @@ public interface Repository {
      *
      * @return the {@link Revision} of the new {@link Commit}
      */
-    default CompletableFuture<Revision> commit(
-            Revision baseRevision, Author author, String summary, Change<?>... changes) {
-        return commit(baseRevision, author, summary, "", Markup.PLAINTEXT, changes);
+    default CompletableFuture<Revision> commit(Revision baseRevision, long commitTimeMillis,
+                                               Author author, String summary, Change<?>... changes) {
+        return commit(baseRevision, commitTimeMillis, author, summary, "", Markup.PLAINTEXT, changes);
     }
 
     /**
@@ -290,12 +349,11 @@ public interface Repository {
      *
      * @return the {@link Revision} of the new {@link Commit}
      */
-    default CompletableFuture<Revision> commit(
-            Revision baseRevision, Author author,
-            String summary, String detail, Markup markup, Change<?>... changes) {
-
+    default CompletableFuture<Revision> commit(Revision baseRevision, long commitTimeMillis,
+                                               Author author, String summary, String detail, Markup markup,
+                                               Change<?>... changes) {
         requireNonNull(changes, "changes");
-        return commit(baseRevision, author, summary, detail, markup, Arrays.asList(changes));
+        return commit(baseRevision, commitTimeMillis, author, summary, detail, markup, Arrays.asList(changes));
     }
 
     /**
@@ -303,9 +361,9 @@ public interface Repository {
      *
      * @return the {@link Revision} of the new {@link Commit}
      */
-    CompletableFuture<Revision> commit(
-            Revision baseRevision, Author author,
-            String summary, String detail, Markup markup, Iterable<Change<?>> changes);
+    CompletableFuture<Revision> commit(Revision baseRevision, long commitTimeMillis,
+                                       Author author, String summary, String detail, Markup markup,
+                                       Iterable<Change<?>> changes);
 
     /**
      * Get a list of {@link Commit} for given pathPattern.
@@ -319,7 +377,7 @@ public interface Repository {
      * @throws StorageException when any internal error occurs.
      */
     default CompletableFuture<List<Commit>> history(Revision from, Revision to, String pathPattern) {
-        return history(from, to, pathPattern, Integer.MAX_VALUE);
+        return history(from, to, pathPattern, DEFAULT_MAX_COMMITS);
     }
 
     /**
@@ -340,19 +398,13 @@ public interface Repository {
      * Awaits and retrieves the latest revision of the commit that changed the file that matches the specified
      * {@code pathPattern} since the specified last known revision.
      */
-    CompletableFuture<Revision> watch(Revision lastKnownRev, String pathPattern);
+    CompletableFuture<Revision> watch(Revision lastKnownRevision, String pathPattern);
 
     /**
      * Awaits and retrieves the change in the query result of the specified file asynchronously since the
      * specified last known revision.
      */
-    default <T> CompletableFuture<QueryResult<T>> watch(Revision lastKnownRev, Query<T> query) {
-        return RepositoryUtil.watch(this, lastKnownRev, query);
+    default <T> CompletableFuture<QueryResult<T>> watch(Revision lastKnownRevision, Query<T> query) {
+        return RepositoryUtil.watch(this, lastKnownRevision, query);
     }
-
-    CompletableFuture<Revision> createRunspace(Author author, int majorRevision);
-
-    CompletableFuture<Void> removeRunspace(int majorRevision);
-
-    CompletableFuture<Set<Revision>> listRunspaces();
 }

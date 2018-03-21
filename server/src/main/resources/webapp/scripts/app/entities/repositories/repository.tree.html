@@ -71,12 +71,10 @@
          ng-href="#/{{project.name}}/{{repository.name}}/history/{{revision}}{{path}}">
         <span class="glyphicon glyphicon-option-vertical"></span> {{ 'entities.button_history' | translate }}
       </a>
-      <button class="btn btn-default"><span class="glyphicon glyphicon-expand"></span>
-        {{ 'entities.button_runspaces' | translate }}</button>
     </div>
 
     <div class="col-xs-12 col-sm-6">
-      <div class="pull-right" has-role="ROLE_USER">
+      <div class="pull-right" has-role="LEVEL_USER">
         <a type="button" class="btn btn-primary"
            ng-href="#/{{project.name}}/{{repository.name}}/new/{{revision}}{{path}}">
           <span class="glyphicon glyphicon-plus"></span> {{ 'entities.button_create' | translate }}

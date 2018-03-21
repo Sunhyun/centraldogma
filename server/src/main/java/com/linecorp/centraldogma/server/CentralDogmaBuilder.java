@@ -28,6 +28,8 @@ import java.util.List;
 import org.apache.shiro.config.Ini;
 
 import com.github.benmanes.caffeine.cache.CaffeineSpec;
+import com.google.common.collect.ImmutableSet;
+import com.google.common.collect.ImmutableSet.Builder;
 
 import com.linecorp.armeria.common.SessionProtocol;
 import com.linecorp.armeria.server.ServerPort;
@@ -55,11 +57,13 @@ public final class CentralDogmaBuilder {
     static final long DEFAULT_MAX_NUM_BYTES_PER_MIRROR = 32 * 1048576; // 32 MiB
     static final String DEFAULT_CACHE_SPEC = "maximumWeight=134217728," + // Cache up to apx. 128-megachars
                                              "expireAfterAccess=5m";      // Expire on 5 minutes of inactivity
+    static final long DEFAULT_WEB_APP_SESSION_TIMEOUT_MILLIS = 604800000;   // 7 days
 
     // Armeria properties
     // Note that we use nullable types here for optional properties.
     // When a property is null, the default value will be used implicitly.
     private final List<ServerPort> ports = new ArrayList<>(2);
+    private TlsConfig tls;
     private Integer numWorkers;
     private Integer maxNumConnections;
     private Long requestTimeoutMillis;
@@ -71,6 +75,7 @@ public final class CentralDogmaBuilder {
     private int numRepositoryWorkers = DEFAULT_NUM_REPOSITORY_WORKERS;
     private String cacheSpec = DEFAULT_CACHE_SPEC;
     private boolean webAppEnabled = true;
+    private long webAppSessionTimeoutMillis = DEFAULT_WEB_APP_SESSION_TIMEOUT_MILLIS;
     private boolean mirroringEnabled = true;
     private int numMirroringThreads = DEFAULT_NUM_MIRRORING_THREADS;
     private int maxNumFilesPerMirror = DEFAULT_MAX_NUM_FILES_PER_MIRROR;
@@ -78,6 +83,8 @@ public final class CentralDogmaBuilder {
     private GracefulShutdownTimeout gracefulShutdownTimeout;
     private ReplicationConfig replicationConfig = ReplicationConfig.NONE;
     private Ini securityConfig;
+    private String accessLogFormat;
+    private final ImmutableSet.Builder<String> administrators = new Builder<>();
 
     /**
      * Creates a new builder with the specified data directory.
@@ -114,6 +121,14 @@ public final class CentralDogmaBuilder {
      */
     public CentralDogmaBuilder port(ServerPort port) {
         ports.add(requireNonNull(port, "port"));
+        return this;
+    }
+
+    /**
+     * Sets a {@link TlsConfig} for supporting TLS on the server.
+     */
+    public CentralDogmaBuilder tls(TlsConfig tls) {
+        this.tls = requireNonNull(tls, "tls");
         return this;
     }
 
@@ -207,6 +222,24 @@ public final class CentralDogmaBuilder {
     }
 
     /**
+     * Sets the session timeout for administrative web application, in milliseconds.
+     * If unspecified, {@value #DEFAULT_WEB_APP_SESSION_TIMEOUT_MILLIS} is used.
+     */
+    public CentralDogmaBuilder webAppSessionTimeoutMillis(long webAppSessionTimeoutMillis) {
+        this.webAppSessionTimeoutMillis = webAppSessionTimeoutMillis;
+        return this;
+    }
+
+    /**
+     * Sets the session timeout for administrative web application.
+     * If unspecified, {@value #DEFAULT_WEB_APP_SESSION_TIMEOUT_MILLIS} is used.
+     */
+    public CentralDogmaBuilder webAppSessionTimeout(Duration webAppSessionTimeout) {
+        return webAppSessionTimeoutMillis(
+                requireNonNull(webAppSessionTimeout, "webAppSessionTimeout").toMillis());
+    }
+
+    /**
      * Sets whether {@link MirroringService} is enabled or not.
      * If unspecified, {@link MirroringService} is enabled.
      */
@@ -273,6 +306,36 @@ public final class CentralDogmaBuilder {
     }
 
     /**
+     * Configures a format of an access log. It will work only if any logging framework is configured.
+     * Read the <a href="https://line.github.io/armeria/server-access-log.html">Writing an access log</a>
+     * document for more information.
+     */
+    public CentralDogmaBuilder accessLogFormat(String accessLogFormat) {
+        this.accessLogFormat = requireNonNull(accessLogFormat, "accessLogFormat");
+        return this;
+    }
+
+    /**
+     * Adds administrators to the set.
+     */
+    public CentralDogmaBuilder administrators(String... administrators) {
+        requireNonNull(administrators, "administrators");
+        for (final String administrator : administrators) {
+            this.administrators.add(administrator);
+        }
+        return this;
+    }
+
+    /**
+     * Adds administrators to the set.
+     */
+    public CentralDogmaBuilder administrators(Iterable<String> administrators) {
+        requireNonNull(administrators, "administrators");
+        this.administrators.addAll(administrators);
+        return this;
+    }
+
+    /**
      * Returns a newly-created {@link CentralDogma} server.
      */
     public CentralDogma build() {
@@ -283,11 +346,13 @@ public final class CentralDogmaBuilder {
         final List<ServerPort> ports = !this.ports.isEmpty() ? this.ports
                                                              : Collections.singletonList(DEFAULT_PORT);
 
-        return new CentralDogmaConfig(dataDir, ports, numWorkers, maxNumConnections,
+        return new CentralDogmaConfig(dataDir, ports, tls, numWorkers, maxNumConnections,
                                       requestTimeoutMillis, idleTimeoutMillis, maxFrameLength,
                                       numRepositoryWorkers, cacheSpec, gracefulShutdownTimeout,
-                                      webAppEnabled, mirroringEnabled, numMirroringThreads,
+                                      webAppEnabled, webAppSessionTimeoutMillis,
+                                      mirroringEnabled, numMirroringThreads,
                                       maxNumFilesPerMirror, maxNumBytesPerMirror, replicationConfig,
-                                      securityConfig != null);
+                                      securityConfig != null, null,
+                                      accessLogFormat, administrators.build());
     }
 }

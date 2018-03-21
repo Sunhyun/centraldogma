@@ -1,8 +1,7 @@
 dependencies {
     compile project(':testing')
-}
-managedDependencies {
     compile 'junit:junit'
     compile 'org.assertj:assertj-core'
     compile 'net.javacrumbs.json-unit:json-unit-fluent'
+    compile 'ch.qos.logback:logback-classic'
 }

@@ -29,6 +29,10 @@ import java.util.Map.Entry;
 import java.util.Properties;
 import java.util.concurrent.atomic.AtomicLong;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.ImmutableList;
 
 import com.linecorp.armeria.client.ClientBuilder;
@@ -52,12 +56,17 @@ import io.netty.util.NetUtil;
  */
 public class CentralDogmaBuilder {
 
+    private static final Logger logger = LoggerFactory.getLogger(CentralDogmaBuilder.class);
+
     private static final int DEFAULT_PORT = 36462;
 
-    private static final AtomicLong nextGroupId = new AtomicLong();
+    @VisibleForTesting
+    static final AtomicLong nextAnonymousGroupId = new AtomicLong();
 
     private ClientFactory clientFactory = ClientFactory.DEFAULT;
-    private final List<Endpoint> endpoints = new ArrayList<>();
+    private List<Endpoint> endpoints = new ArrayList<>();
+    private boolean useTls;
+    private String selectedProfile;
     private ArmeriaClientConfigurator clientConfigurator = cb -> {
     };
 
@@ -109,7 +118,23 @@ public class CentralDogmaBuilder {
             host = '[' + host + ']';
         }
 
+        checkState(selectedProfile == null, "profile() and host() cannot be used together.");
         endpoints.add(Endpoint.parse(host + ':' + port));
+        return this;
+    }
+
+    /**
+     * Sets the client to use TLS.
+     */
+    public CentralDogmaBuilder useTls() {
+        return useTls(true);
+    }
+
+    /**
+     * Sets whether the client uses TLS or not.
+     */
+    public CentralDogmaBuilder useTls(boolean useTls) {
+        this.useTls = useTls;
         return this;
     }
 
@@ -196,13 +221,16 @@ public class CentralDogmaBuilder {
     public CentralDogmaBuilder profile(ClassLoader classLoader, Iterable<String> profiles) {
         requireNonNull(classLoader, "classLoader");
         requireNonNull(profiles, "profiles");
+        checkState(selectedProfile == null, "profile cannot be loaded more than once.");
+        checkState(endpoints.isEmpty(), "profile() and host() cannot be used together.");
 
-        int numProfiles = 0;
-        int numTotalHosts = 0;
-        for (String p : profiles) {
+        String selectedProfile = null;
+        List<Endpoint> endpoints = null;
+        boolean profilesIsEmpty = true;
+        loop: for (String p : profiles) {
             checkNotNull(p, "profiles contains null: %s", profiles);
+            profilesIsEmpty = false;
 
-            numProfiles++;
             final String path = "centraldogma-profile-" + p + ".properties";
             final InputStream in = classLoader.getResourceAsStream(path);
             if (in == null) {
@@ -210,30 +238,40 @@ public class CentralDogmaBuilder {
             }
 
             try {
+                final List<Endpoint> newEndpoints = new ArrayList<>();
                 final Properties props = new Properties();
                 props.load(in);
-                int numHosts = 0;
                 for (Entry<Object, Object> e : props.entrySet()) {
                     final String key = (String) e.getKey();
                     final String value = (String) e.getValue();
 
                     if (key.startsWith("centraldogma.hosts.")) {
                         final Endpoint endpoint = Endpoint.parse(value);
-                        checkState(!endpoint.isGroup(),
-                                   "%s contains an endpoint group which is not allowed: %s", path, value);
-                        host(endpoint.host(), endpoint.port(DEFAULT_PORT));
-                        numHosts++;
-                        numTotalHosts++;
+                        if (endpoint.isGroup()) {
+                            logger.warn("Ignoring {}: contains an endpoint group which is not allowed (%s)",
+                                        path, value);
+                            continue loop;
+                        }
+                        newEndpoints.add(endpoint.withDefaultPort(DEFAULT_PORT));
                     }
                 }
-                checkState(numHosts > 0, "%s contains no hosts.", path);
+
+                if (newEndpoints.isEmpty()) {
+                    logger.warn("Ignoring {}: contains no hosts", path);
+                } else {
+                    selectedProfile = p;
+                    endpoints = newEndpoints;
+                }
             } catch (IOException e) {
                 throw new IllegalArgumentException("failed to load: " + path, e);
             }
         }
 
-        checkArgument(numProfiles > 0, "profiles is empty.");
-        checkArgument(numTotalHosts > 0, "no profile matches: %s", profiles);
+        checkArgument(!profilesIsEmpty, "profiles is empty.");
+        checkArgument(selectedProfile != null, "no profile matches: %s", profiles);
+
+        this.selectedProfile = selectedProfile;
+        this.endpoints = endpoints;
         return this;
     }
 
@@ -265,13 +303,22 @@ public class CentralDogmaBuilder {
         if (endpoints.size() == 1) {
             endpoint = endpoints.get(0);
         } else {
-            final String groupName = "centraldogma-" + nextGroupId.getAndIncrement();
+            final String groupName;
+            if (selectedProfile != null) {
+                // Generate a group name from profile name.
+                groupName = "centraldogma-profile-" + selectedProfile;
+            } else {
+                // Generate an anonymous group name with an arbitrary integer.
+                groupName = "centraldogma-anonymous-" + nextAnonymousGroupId.getAndIncrement();
+            }
+
             EndpointGroupRegistry.register(groupName, new StaticEndpointGroup(endpoints),
                                            EndpointSelectionStrategy.ROUND_ROBIN);
             endpoint = Endpoint.ofGroup(groupName);
         }
 
-        final String uri = "tbinary+http://" + endpoint.authority() + "/cd/thrift/v1";
+        final String scheme = "tbinary+" + (useTls ? "https" : "http") + "://";
+        final String uri = scheme + endpoint.authority() + "/cd/thrift/v1";
         final ClientBuilder builder = new ClientBuilder(uri)
                 .factory(clientFactory)
                 .decorator(RpcRequest.class, RpcResponse.class,

@@ -15,7 +15,7 @@ angular.module('CentralDogmaAdmin')
                      });
                      return cb();
                    }).catch(function (err) {
-                     this.logout();
+                     this.logout0(false);
                      deferred.reject(err);
                      return cb(err);
                    }.bind(this));
@@ -24,10 +24,18 @@ angular.module('CentralDogmaAdmin')
                  },
 
                  logout: function () {
-                   AuthServerProvider.logout();
-                   if (Principal.clear()) {
-                     NotificationUtil.success("login.logged_out");
-                   }
+                   return this.logout0(true);
+                 },
+
+                 logout0: function (isNotify) {
+                   var deferred = $q.defer();
+                   AuthServerProvider.logout().then(function () {
+                     if (isNotify) {
+                       NotificationUtil.success("login.logged_out");
+                     }
+                     deferred.resolve(null);
+                   });
+                   return deferred.promise;
                  },
 
                  isEnabled: function () {

@@ -19,9 +19,11 @@ package com.linecorp.centraldogma.internal;
 import static java.util.Objects.requireNonNull;
 
 import java.io.BufferedReader;
+import java.io.File;
 import java.io.IOException;
 import java.io.StringReader;
-import java.util.LinkedList;
+import java.nio.file.Files;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -36,12 +38,22 @@ public final class Util {
             "^(?:[-_0-9a-zA-Z](?:[-_\\.0-9a-zA-Z]*[-_0-9a-zA-Z])?)+$");
     private static final Pattern FILE_PATH_PATTERN = Pattern.compile(
             "^(?:/[-_0-9a-zA-Z](?:[-_\\.0-9a-zA-Z]*[-_0-9a-zA-Z])?)+$");
+    private static final Pattern JSON_FILE_PATH_PATTERN = Pattern.compile(
+            "^(?:/[-_0-9a-zA-Z](?:[-_\\.0-9a-zA-Z]*[-_0-9a-zA-Z])?)+\\.(?i)json$");
     private static final Pattern DIR_PATH_PATTERN = Pattern.compile(
             "^(?:/[-_0-9a-zA-Z](?:[-_\\.0-9a-zA-Z]*[-_0-9a-zA-Z])?)*/?$");
     private static final Pattern EMAIL_PATTERN = Pattern.compile(
             "^[_A-Za-z0-9-\\+]+(?:\\.[_A-Za-z0-9-]+)*@[A-Za-z0-9-]+(?:\\.[A-Za-z0-9]+)*(?:\\.[A-Za-z]{2,})$");
     private static final Pattern GENERAL_EMAIL_PATTERN = Pattern.compile(
             "^[_A-Za-z0-9-\\+]+(?:\\.[_A-Za-z0-9-]+)*@(.+)$");
+
+    /**
+     * Start with an alphanumeric character.
+     * An alphanumeric character, minus, plus, underscore and dot are allowed in the middle.
+     * End with an alphanumeric character.
+     */
+    private static final Pattern PROJECT_AND_REPO_NAME_PATTERN =
+            Pattern.compile("^[0-9A-Za-z](?:[-+_0-9A-Za-z\\.]*[0-9A-Za-z])?$");
 
     public static String validateFileName(String name, String paramName) {
         requireNonNull(name, paramName);
@@ -51,6 +63,11 @@ public final class Util {
 
         throw new IllegalArgumentException(
                 paramName + ": " + name + " (expected: " + FILE_NAME_PATTERN.pattern() + ')');
+    }
+
+    public static boolean isValidFileName(String name) {
+        requireNonNull(name, "name");
+        return !name.isEmpty() && FILE_NAME_PATTERN.matcher(name).matches();
     }
 
     public static String validateFilePath(String path, String paramName) {
@@ -63,15 +80,26 @@ public final class Util {
                 paramName + ": " + path + " (expected: " + FILE_PATH_PATTERN.pattern() + ')');
     }
 
-    public static boolean isValidFileName(String name) {
-        requireNonNull(name, "name");
-        return !name.isEmpty() && FILE_NAME_PATTERN.matcher(name).matches();
-    }
-
     public static boolean isValidFilePath(String path) {
         requireNonNull(path, "path");
         return !path.isEmpty() && path.charAt(0) == '/' &&
                FILE_PATH_PATTERN.matcher(path).matches();
+    }
+
+    public static String validateJsonFilePath(String path, String paramName) {
+        requireNonNull(path, paramName);
+        if (isValidJsonFilePath(path)) {
+            return path;
+        }
+
+        throw new IllegalArgumentException(
+                paramName + ": " + path + " (expected: " + JSON_FILE_PATH_PATTERN.pattern() + ')');
+    }
+
+    public static boolean isValidJsonFilePath(String path) {
+        requireNonNull(path, "path");
+        return !path.isEmpty() && path.charAt(0) == '/' &&
+               JSON_FILE_PATH_PATTERN.matcher(path).matches();
     }
 
     public static String validateDirPath(String path, String paramName) {
@@ -84,8 +112,41 @@ public final class Util {
                 paramName + ": " + path + " (expected: " + DIR_PATH_PATTERN.pattern() + ')');
     }
 
+    public static boolean isValidProjectName(String projectName) {
+        requireNonNull(projectName, "projectName");
+        return PROJECT_AND_REPO_NAME_PATTERN.matcher(projectName).matches();
+    }
+
+    public static String validateProjectName(String projectName, String paramName) {
+        if (isValidProjectName(projectName)) {
+            return projectName;
+        }
+        throw new IllegalArgumentException(paramName + ": " + projectName +
+                                           " (expected: " + PROJECT_AND_REPO_NAME_PATTERN.pattern() + ')');
+    }
+
+    public static boolean isValidRepositoryName(String repoName) {
+        requireNonNull(repoName, "projectName");
+        return PROJECT_AND_REPO_NAME_PATTERN.matcher(repoName).matches();
+    }
+
+    public static String validateRepositoryName(String repoName, String paramName) {
+        if (isValidRepositoryName(repoName)) {
+            return repoName;
+        }
+        throw new IllegalArgumentException(paramName + ": " + repoName +
+                                           " (expected: " + PROJECT_AND_REPO_NAME_PATTERN.pattern() + ')');
+    }
+
     public static boolean isValidDirPath(String path) {
+        return isValidDirPath(path, false);
+    }
+
+    public static boolean isValidDirPath(String path, boolean mustEndWithSlash) {
         requireNonNull(path);
+        if (mustEndWithSlash && !path.endsWith("/")) {
+            return false;
+        }
         return !path.isEmpty() && path.charAt(0) == '/' &&
                DIR_PATH_PATTERN.matcher(path).matches();
     }
@@ -118,11 +179,24 @@ public final class Util {
                 " (expected: " + EMAIL_PATTERN.pattern() + " or IP address domain)");
     }
 
+    public static String toEmailAddress(String emailAddr, String paramName) {
+        requireNonNull(emailAddr, paramName);
+        if (isValidEmailAddress(emailAddr)) {
+            return emailAddr;
+        }
+        return emailAddr + "@localhost.localdomain";
+    }
+
+    public static String emailToUsername(String emailAddr, String paramName) {
+        validateEmailAddress(emailAddr, paramName);
+        return emailAddr.substring(0, emailAddr.indexOf('@'));
+    }
+
     public static List<String> stringToLines(String str) {
-        BufferedReader reader = new BufferedReader(new StringReader(str));
-        List<String> lines = new LinkedList<>();
-        String line;
+        final BufferedReader reader = new BufferedReader(new StringReader(str));
+        final List<String> lines = new ArrayList<>(128);
         try {
+            String line;
             while ((line = reader.readLine()) != null) {
                 lines.add(line);
             }
@@ -374,6 +448,15 @@ public final class Util {
 
     private static boolean isValidHexChar(char c) {
         return c >= '0' && c <= '9' || c >= 'A' && c <= 'F' || c >= 'a' && c <= 'f';
+    }
+
+    /**
+     * Deletes the specified {@code directory} recursively.
+     */
+    public static void deleteFileTree(File directory) throws IOException {
+        if (directory.exists()) {
+            Files.walkFileTree(directory.toPath(), DeletingFileVisitor.INSTANCE);
+        }
     }
 
     private Util() {}

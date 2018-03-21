@@ -1,10 +1,8 @@
 dependencies {
-    compile project(':client:client-java')
-}
-
-managedDependencies {
-    compile 'org.hibernate.validator:hibernate-validator'
+    compile project(':client:java')
+    compile 'javax.validation:validation-api'
     compile 'org.springframework.boot:spring-boot-starter'
 
     testCompile 'org.springframework.boot:spring-boot-starter-test'
+    testRuntime 'org.hibernate.validator:hibernate-validator'
 }

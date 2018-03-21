@@ -28,6 +28,7 @@ import org.slf4j.LoggerFactory;
 
 import com.google.common.collect.ImmutableList;
 
+import com.linecorp.armeria.common.util.Exceptions;
 import com.linecorp.centraldogma.common.Author;
 import com.linecorp.centraldogma.common.Change;
 import com.linecorp.centraldogma.common.Markup;
@@ -115,11 +116,14 @@ public final class ProjectInitializer {
             "  \"" + SAMPLE_TEXT[4] + "\" ]";
 
     public static final String INTERNAL_PROJECT_NAME = "dogma";
-    public static final String SESSION_REPOSITORY_NAME = "sessions";
-    public static final String TOKEN_REPOSITORY_NAME = "tokens";
 
     static CompletableFuture<Revision> generateSampleFiles(
             CommandExecutor executor, String projectName, String repositoryName) {
+
+        // Do not generate sample files for internal projects.
+        if (projectName.equals(INTERNAL_PROJECT_NAME)) {
+            return CompletableFuture.completedFuture(Revision.INIT);
+        }
 
         logger.info("Generating sample files into: {}/{}", projectName, repositoryName);
 
@@ -129,31 +133,32 @@ public final class ProjectInitializer {
                 Change.ofJsonUpsert("/samples/qux.json", SAMPLE_JSON_ARRAY));
 
         return executor.execute(Command.push(
-                projectName, repositoryName, Revision.HEAD, Author.SYSTEM,
+                Author.SYSTEM, projectName, repositoryName, Revision.HEAD,
                 "Add the sample files", "", Markup.PLAINTEXT, changes));
     }
 
     /**
-     * Creates an internal project and repositories such as a session storage and a token storage.
+     * Creates an internal project and repositories such as a token storage.
      */
     public static void initializeInternalProject(CommandExecutor executor) {
         try {
-            executor.execute(createProject(INTERNAL_PROJECT_NAME))
+            executor.execute(createProject(Author.SYSTEM, INTERNAL_PROJECT_NAME))
                     .get();
-        } catch (Exception e) {
-            if (!(e.getCause() instanceof ProjectExistsException)) {
-                throw new Error(e);
+        } catch (Throwable cause) {
+            cause = Exceptions.peel(cause);
+            if (!(cause instanceof ProjectExistsException)) {
+                throw new Error("failed to initialize an internal project", cause);
             }
         }
         for (final String repo : ImmutableList.of(Project.REPO_META,
-                                                  SESSION_REPOSITORY_NAME,
-                                                  TOKEN_REPOSITORY_NAME)) {
+                                                  Project.REPO_MAIN)) {
             try {
-                executor.execute(createRepository(INTERNAL_PROJECT_NAME, repo))
+                executor.execute(createRepository(Author.SYSTEM, INTERNAL_PROJECT_NAME, repo))
                         .get();
-            } catch (Exception e) {
-                if (!(e.getCause() instanceof RepositoryExistsException)) {
-                    throw new Error(e);
+            } catch (Throwable cause) {
+                cause = Exceptions.peel(cause);
+                if (!(cause instanceof RepositoryExistsException)) {
+                    throw new Error(cause);
                 }
             }
         }

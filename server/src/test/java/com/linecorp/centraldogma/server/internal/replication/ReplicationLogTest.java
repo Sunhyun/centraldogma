@@ -27,20 +27,28 @@ import com.linecorp.centraldogma.common.Revision;
 import com.linecorp.centraldogma.server.internal.command.Command;
 
 public class ReplicationLogTest {
+
+    private static final Author AUTHOR = new Author("foo", "bar@baz.com");
+
     @Test
     public void testJsonConversion() {
-        assertJsonConversion(new ReplicationLog<>("r1", Command.createProject("foo"), null),
+        assertJsonConversion(new ReplicationLog<>("r1", Command.createProject(1234L, AUTHOR, "foo"), null),
                              '{' +
                              "  \"replicaId\": \"r1\"," +
                              "  \"command\": {" +
                              "    \"type\": \"CREATE_PROJECT\"," +
-                             "    \"projectName\": \"foo\"" +
+                             "    \"projectName\": \"foo\"," +
+                             "    \"timestamp\": 1234," +
+                             "    \"author\": {" +
+                             "      \"name\": \"foo\"," +
+                             "      \"email\": \"bar@baz.com\"" +
+                             "    }" +
                              "  }," +
                              "  \"result\": null" +
                              '}');
 
         Command<Revision> pushCommand = Command.push(
-                "foo", "bar", Revision.HEAD, new Author("Sedol Lee", "sedol@lee.com"),
+                1234L, new Author("Sedol Lee", "sedol@lee.com"), "foo", "bar", Revision.HEAD,
                 "4:1", "L-L-L-W-L", Markup.PLAINTEXT, Change.ofTextUpsert("/result.txt", "too soon to tell"));
 
         assertJsonConversion(new ReplicationLog<>("r2", pushCommand, new Revision(43)),
@@ -50,10 +58,8 @@ public class ReplicationLogTest {
                              "    \"type\": \"PUSH\"," +
                              "    \"projectName\": \"foo\"," +
                              "    \"repositoryName\": \"bar\"," +
-                             "    \"baseRevision\": {" +
-                             "      \"major\": -1," +
-                             "      \"minor\": 0" +
-                             "    }," +
+                             "    \"baseRevision\": -1," +
+                             "    \"timestamp\": 1234," +
                              "    \"author\": {" +
                              "      \"name\": \"Sedol Lee\"," +
                              "      \"email\": \"sedol@lee.com\"" +
@@ -67,10 +73,7 @@ public class ReplicationLogTest {
                              "      \"content\": \"too soon to tell\"" +
                              "    }]" +
                              "  }," +
-                             "  \"result\": {" +
-                             "    \"major\": 43," +
-                             "    \"minor\": 0" +
-                             "  }" +
+                             "  \"result\": 43" +
                              '}');
     }
 }

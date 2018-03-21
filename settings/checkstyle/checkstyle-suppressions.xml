@@ -10,7 +10,5 @@
   <!-- Suppress UncommentedMain for the server entry point -->
   <suppress checks="UncommentedMain" files="[\\/]Main\.java$" />
   <!-- Suppress all checks in generated sources -->
-  <suppress checks=".*" files="[\\/]gen-java[\\/]" />
-  <!-- Suppress all checks in json-patch sources, which were forked. -->
-  <suppress checks=".*" files="[\\/]internal[\\/]jsonpatch[\\/]" />
+  <suppress checks=".*" files="[\\/]gen-src[\\/]" />
 </suppressions>

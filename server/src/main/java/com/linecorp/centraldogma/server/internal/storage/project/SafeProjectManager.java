@@ -61,15 +61,9 @@ public class SafeProjectManager implements ProjectManager {
     }
 
     @Override
-    public Project getOrCreate(String name) {
+    public Project create(String name, long creationTimeMillis) {
         validateProjectName(name);
-        return delegate().getOrCreate(name);
-    }
-
-    @Override
-    public Project create(String name) {
-        validateProjectName(name);
-        return delegate().create(name);
+        return delegate().create(name, creationTimeMillis);
     }
 
     @Override
@@ -112,7 +106,7 @@ public class SafeProjectManager implements ProjectManager {
 
     protected static void validateProjectName(String name) {
         if (!isValidProjectName(name)) {
-            throw new IllegalArgumentException("Illegal access to project '" + name + "'");
+            throw new IllegalArgumentException("Illegal access to project '" + name + '\'');
         }
     }
 

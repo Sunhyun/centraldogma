@@ -14,15 +14,15 @@ angular.module('CentralDogmaAdmin')
                      }
                    }).then(function (sessionId) {
                      if (sessionId !== null) {
-                       $window.sessionStorage.setItem('sessionId', sessionId);
+                       $window.localStorage.setItem('sessionId', sessionId);
                      }
                      return sessionId;
                    });
                  },
 
                  logout: function () {
-                   ApiService.post('logout', '').then(function (data) {
-                     $window.sessionStorage.clear();
+                   return ApiService.post('logout', '').then(function (data) {
+                     $window.localStorage.clear();
                      Principal.refresh(); // Clear user info.
                      return data;
                    });
